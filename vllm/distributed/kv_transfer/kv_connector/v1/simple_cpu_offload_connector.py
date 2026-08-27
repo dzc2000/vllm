@@ -48,6 +48,8 @@ _DISK_ONLY_KEYS = (
     "disk_capacity_bytes",
     "disk_buffer_slots",
     "use_page_cache",
+    "disk_coalesce_io",
+    "disk_segment_bytes",
 )
 
 
@@ -105,6 +107,27 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
         disk_buffer_slots = max(1, int(extra_config.get("disk_buffer_slots", 2)))
         use_page_cache = bool(extra_config.get("use_page_cache", False))
+        # KVLog M3 阶段一：run 合并 I/O 开关（默认开；关闭 = 原生逐块路径，
+        # 用于 A/B 对比与回退）与组缓冲大小。
+        disk_coalesce_io = bool(extra_config.get("disk_coalesce_io", True))
+        disk_segment_bytes = int(
+            extra_config.get("disk_segment_bytes", 16 * (1024**2))
+        )
+
+        # KVLog profiling：环境变量在 EngineCore 子进程中不可靠，
+        # 经 extra_config（随 VllmConfig 序列化传递）激活是可靠路径。
+        logger.info(
+            "KVLog debug: role=%s extra_config keys=%s kvlog_profile=%r",
+            role.name,
+            sorted(extra_config.keys()),
+            extra_config.get("kvlog_profile"),
+        )
+        if extra_config.get("kvlog_profile", False):
+            from vllm.v1.simple_kv_offload import profiler
+
+            profiler.activate(
+                extra_config.get("kvlog_profile_out") or None
+            )
 
         if disk_mode:
             if disk_path is None:
@@ -168,6 +191,8 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 disk_capacity_bytes=disk_capacity_bytes,
                 disk_buffer_slots=disk_buffer_slots,
                 use_page_cache=use_page_cache,
+                disk_coalesce_io=disk_coalesce_io,
+                disk_segment_bytes=disk_segment_bytes,
             )
 
     # --- Worker-side methods ---

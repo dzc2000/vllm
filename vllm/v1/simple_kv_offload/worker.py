@@ -9,6 +9,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1.simple_kv_offload import profiler
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 from vllm.v1.simple_kv_offload.disk_backend import DiskBackend
@@ -36,6 +37,8 @@ class SimpleCPUOffloadWorker:
         disk_capacity_bytes: int = 0,
         disk_buffer_slots: int = 2,
         use_page_cache: bool = False,
+        disk_coalesce_io: bool = True,
+        disk_segment_bytes: int = 16 * (1024**2),
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -44,6 +47,8 @@ class SimpleCPUOffloadWorker:
         self.disk_capacity_bytes = disk_capacity_bytes
         self.disk_buffer_slots = disk_buffer_slots
         self.use_page_cache = use_page_cache
+        self.disk_coalesce_io = disk_coalesce_io
+        self.disk_segment_bytes = disk_segment_bytes
         self.disk_mode = kv_offload_backend == "disk"
 
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
@@ -77,6 +82,10 @@ class SimpleCPUOffloadWorker:
         self._pending_store_event_indices: set[int] = set()
         # Completed store events to report via build_connector_worker_meta
         self._completed_store_events: dict[int, int] = {}
+
+        # KVLog profiling（KVLOG_PROFILE=0 时不使用）：load 提交时间戳，
+        # event_idx -> submit perf_counter
+        self._load_submit_ts: dict[int, float] = {}
 
     def register_kv_caches(
         self,
@@ -173,6 +182,8 @@ class SimpleCPUOffloadWorker:
             total_bytes_per_block,
             self.disk_buffer_slots,
             self.use_page_cache,
+            coalesce_io=self.disk_coalesce_io,
+            segment_bytes=self.disk_segment_bytes,
         )
 
     def _init_cpu_mode(
@@ -256,6 +267,8 @@ class SimpleCPUOffloadWorker:
             backend = self._backend
             assert backend is not None
             if metadata.load_cpu_blocks:
+                if profiler.PROFILE:
+                    self._load_submit_ts[metadata.load_event] = profiler.now()
                 backend.launch_copy(
                     metadata.load_cpu_blocks,
                     metadata.load_gpu_blocks,
@@ -278,6 +291,9 @@ class SimpleCPUOffloadWorker:
 
         # (2) Track completed transfer events
         finished_recving: set[str] = set()
+
+        if profiler.PROFILE:
+            profiler.note_pending(len(self._pending_load_event_indices))
 
         if self._pending_load_event_indices:
             load_wm = self._poll_stream_events(is_store=False)
@@ -317,6 +333,8 @@ class SimpleCPUOffloadWorker:
 
     def _flush_and_sync_all(self) -> None:
         """Synchronize all in-flight transfer events."""
+        # KVLog profiling：抢占 flush 是 engine 的真实阻塞点
+        t0 = profiler.now() if profiler.PROFILE else 0.0
         for event_idx, event in self._load_events:
             event.synchronize()
             self._load_hwm = event_idx
@@ -326,6 +344,8 @@ class SimpleCPUOffloadWorker:
             event.synchronize()
             self._store_hwm = event_idx
         self._store_events.clear()
+        if profiler.PROFILE:
+            profiler.note_flush(profiler.now() - t0)
 
     def _poll_stream_events(self, is_store: bool) -> int:
         """Non-blocking poll for completed events and return the high-water mark."""
@@ -337,6 +357,11 @@ class SimpleCPUOffloadWorker:
                 break
             hwm = event_idx
             events.pop(0)
+            # KVLog profiling：load 完成延迟（submit -> done）
+            if profiler.PROFILE and not is_store:
+                submit_ts = self._load_submit_ts.pop(event_idx, None)
+                if submit_ts is not None:
+                    profiler.note_load_event(submit_ts, profiler.now())
         if is_store:
             self._store_hwm = hwm
         else:

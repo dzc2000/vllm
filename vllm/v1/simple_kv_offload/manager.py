@@ -3,6 +3,7 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -62,6 +63,97 @@ class StoreRequestState:
     num_stored_blocks: list[int]
     store_events: set[int] = field(default_factory=set)
     finished: bool = False
+
+
+class _DiskSegmentAllocator:
+    """段式磁盘 slot 分配器（KVLog M3 阶段一）。
+
+    - 固定 ``segment_size``（默认 32）slot 段；64 KiB block 下即 2 MiB；
+    - 段内 bump 顺序分配：同一请求先后落盘的块天然聚成物理连续 run，
+      是 disk_backend run 合并 I/O（单次大 pwritev/preadv）的前提；
+    - 整段空闲时归还段空闲列表（FIFO 轮转，最大化旧缓存数据存活时间）；
+      阶段一简单版不做段内整理，部分空闲的段不参与再分配；
+    - 以 BlockPool 的 ``ref_cnt`` 为唯一事实源：每次分发前逐 slot 校验，
+      被 load pin 或其他路径占用的 slot 自动跳过，任何分配路径都不会
+      造成双重分配。
+    """
+
+    def __init__(
+        self,
+        pool: BlockPool,
+        num_slots: int,
+        segment_size: int = 32,
+    ) -> None:
+        self._pool = pool
+        self._blocks = pool.blocks
+        self._num_slots = num_slots
+        self._seg_size = segment_size
+        self._num_segs = cdiv(num_slots, segment_size)
+        self._free_segs: deque[int] = deque(range(self._num_segs))
+        self._seg_free: list[bool] = [True] * self._num_segs
+        self._active: int = -1
+        self._off: int = 0
+        # 观测计数（段利用率计量用）
+        self.num_taken: int = 0
+        self.num_segments_recycled: int = 0
+
+    def take_block(self) -> "KVCacheBlock | None":
+        """段内 bump 取下一个空闲 slot，并完成池记账（出队/逐 hash/引用计数）。
+
+        容量耗尽（无整段空闲可激活）时返回 None，调用方按 out_of_space 处理。
+        """
+        pool = self._pool
+        while True:
+            if self._active < 0:
+                if not self._free_segs:
+                    return None
+                self._active = self._free_segs.popleft()
+                self._seg_free[self._active] = False
+                self._off = 0
+            base = self._active * self._seg_size
+            while self._off < self._seg_size:
+                bid = base + self._off
+                self._off += 1
+                if bid >= self._num_slots:
+                    break
+                blk = self._blocks[bid]
+                if blk.is_null or blk.ref_cnt != 0:
+                    # 被 load pin 或其他分配路径占用，跳过保正确性
+                    continue
+                pool.free_block_queue.remove(blk)
+                if pool.enable_caching:
+                    pool._maybe_evict_cached_block(blk)
+                blk.ref_cnt += 1
+                if pool.metrics_collector is not None:
+                    pool.metrics_collector.on_block_allocated(blk)
+                self.num_taken += 1
+                return blk
+            # 当前段已扫完，换下一段；若整段已空闲（如块在 active 期间
+            # 被释放且之后再无该段的释放事件），立即归还避免槽位滞留
+            seg = self._active
+            self._active = -1
+            self._try_recycle(seg)
+
+    def _try_recycle(self, seg: int) -> None:
+        """段内全部 slot 空闲（ref_cnt==0 或 null）时归还段空闲列表尾部。"""
+        if self._seg_free[seg]:
+            return
+        base = seg * self._seg_size
+        end = min(base + self._seg_size, self._num_slots)
+        if all(
+            self._blocks[b].is_null or self._blocks[b].ref_cnt == 0
+            for b in range(base, end)
+        ):
+            self._seg_free[seg] = True
+            self._free_segs.append(seg)
+            self.num_segments_recycled += 1
+
+    def note_freed(self, block_ids: Iterable[int]) -> None:
+        """块归还后检查所属段是否整段空闲，是则归还段空闲列表尾部。"""
+        for seg in {bid // self._seg_size for bid in block_ids}:
+            if seg == self._active:
+                continue
+            self._try_recycle(seg)
 
 
 class SimpleCPUOffloadScheduler:
@@ -141,6 +233,19 @@ class SimpleCPUOffloadScheduler:
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
         self._gpu_block_pool: BlockPool | None = None
+
+        # KVLog M3 阶段一：磁盘模式下用段式分配器保证 disk slot 物理连续
+        # （run 合并 I/O 的前提）。CPU 模式保持原生 free-queue 分配。
+        self._disk_seg_alloc: _DiskSegmentAllocator | None = None
+        if disk_capacity_bytes > 0:
+            self._disk_seg_alloc = _DiskSegmentAllocator(
+                self.cpu_block_pool, self.num_cpu_blocks, segment_size=32
+            )
+            logger.info(
+                "SimpleCPUOffloadScheduler: disk segment allocator on "
+                "(%d slots, seg=32)",
+                self.num_cpu_blocks,
+            )
 
         # Load metadata
         self._reqs_to_load: dict[str, LoadRequestState] = {}
@@ -491,7 +596,9 @@ class SimpleCPUOffloadScheduler:
 
         gpu_ids: list[int] = []
         block_hashes: list[bytes] = []
+        cpu_blocks: list[KVCacheBlock] = []
         last_visited = self._cursor
+        seg_alloc = self._disk_seg_alloc
 
         for covered, node in enumerate(free_queue.iter_blocks_after(self._cursor)):
             if covered >= self._target_free or len(gpu_ids) >= num_cpu_free:
@@ -505,6 +612,12 @@ class SimpleCPUOffloadScheduler:
                 and not node.is_null
                 and cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is None
             ):
+                if seg_alloc is not None:
+                    # 段式分配：逐块 bump 出连续 disk slot（耗尽即止）
+                    cpu_blk = seg_alloc.take_block()
+                    if cpu_blk is None:
+                        break
+                    cpu_blocks.append(cpu_blk)
                 gpu_ids.append(node.block_id)
                 block_hashes.append(bhash)
 
@@ -512,7 +625,8 @@ class SimpleCPUOffloadScheduler:
 
         # Batch-allocate CPU blocks and stamp hashes.
         if gpu_ids:
-            cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
+            if seg_alloc is None:
+                cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
             cpu_ids = [blk.block_id for blk in cpu_blocks]
             for cpu_blk, bhash in zip(cpu_blocks, block_hashes):  # type: ignore[assignment]
                 cpu_blk._block_hash = bhash  # type: ignore[assignment]
@@ -546,6 +660,7 @@ class SimpleCPUOffloadScheduler:
             return [], [], []
         cpu_block_pool = self.cpu_block_pool
         num_free = cpu_block_pool.get_num_free_blocks()
+        seg_alloc = self._disk_seg_alloc
         kv_cache_groups = self.cpu_kv_cache_config.kv_cache_groups
         num_groups = len(kv_cache_groups)
         # Dedup against blocks already scheduled.
@@ -576,6 +691,8 @@ class SimpleCPUOffloadScheduler:
             # --- Phase 1: Scan blocks, classify as cached vs to-store ---
             gpu_block_ids: list[int] = []
             block_hashes_to_store: list[bytes] = []
+            # 段式分配时逐块在此获取 CPU/磁盘块（bump 连续）；否则扫描后批量分配
+            cpu_blocks_alloc: list[KVCacheBlock] = []
             advanced_per_group: list[int] = [0] * num_groups
             out_of_space = False
             # Confirmed tokens: KV data written and visible to all streams.
@@ -621,10 +738,18 @@ class SimpleCPUOffloadScheduler:
                         advanced_per_group[g] += 1
                         continue
 
-                    if num_free <= 0:
-                        out_of_space = True
-                        break
-                    num_free -= 1
+                    if seg_alloc is not None:
+                        # 段式分配：逐块 bump 出连续 disk slot（耗尽即 out_of_space）
+                        cpu_blk = seg_alloc.take_block()
+                        if cpu_blk is None:
+                            out_of_space = True
+                            break
+                        cpu_blocks_alloc.append(cpu_blk)
+                    else:
+                        if num_free <= 0:
+                            out_of_space = True
+                            break
+                        num_free -= 1
 
                     gpu_block_ids.append(gpu_block_id)
                     block_hashes_to_store.append(bhash_with_group)
@@ -636,7 +761,8 @@ class SimpleCPUOffloadScheduler:
             # --- Phase 2: Batch allocate CPU blocks and stamp hashes ---
             n_to_alloc = len(gpu_block_ids)
             if n_to_alloc > 0:
-                cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
+                if seg_alloc is None:
+                    cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
                 for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes_to_store):
                     cpu_blk._block_hash = bhash  # type: ignore[assignment]
@@ -740,7 +866,7 @@ class SimpleCPUOffloadScheduler:
             self.cpu_block_pool.cached_block_hash_to_block.insert(bhash, cpu_block)
 
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
-        self.cpu_block_pool.free_blocks(cpu_blocks)
+        self._free_cpu_blocks(cpu_blocks)
         assert self._gpu_block_pool is not None
         self._gpu_block_pool.free_blocks(
             self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
@@ -751,7 +877,7 @@ class SimpleCPUOffloadScheduler:
         cpu_blocks = [self.cpu_block_pool.blocks[bid] for bid in transfer.cpu_block_ids]
         for cpu_block in cpu_blocks:
             cpu_block.reset_hash()
-        self.cpu_block_pool.free_blocks(cpu_blocks)
+        self._free_cpu_blocks(cpu_blocks)
         assert self._gpu_block_pool is not None
         self._gpu_block_pool.free_blocks(
             self._gpu_block_pool.blocks[bid] for bid in transfer.gpu_block_ids
@@ -804,6 +930,13 @@ class SimpleCPUOffloadScheduler:
     ) -> tuple[bool, dict[str, Any] | None]:
         return self.request_finished(request, block_ids=[])
 
+    def _free_cpu_blocks(self, blocks: "Iterable[KVCacheBlock]") -> None:
+        """释放 CPU/磁盘池块，并通知段分配器做整段回收检查。"""
+        block_list = list(blocks)
+        self.cpu_block_pool.free_blocks(block_list)
+        if self._disk_seg_alloc is not None:
+            self._disk_seg_alloc.note_freed(b.block_id for b in block_list)
+
     def _free_pending_cpu_hit(self, pending: tuple) -> None:
         """Release the temporary CPU block pin taken in get_num_new_matched_tokens()."""
         cpu_hit_blocks, _ = pending
@@ -811,7 +944,7 @@ class SimpleCPUOffloadScheduler:
             blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
         ]
         if blocks_to_free:
-            self.cpu_block_pool.free_blocks(blocks_to_free)
+            self._free_cpu_blocks(blocks_to_free)
 
     def _cleanup_load_request(self, req_id: str) -> None:
         """Release all load resources for a request.
@@ -836,7 +969,7 @@ class SimpleCPUOffloadScheduler:
 
         if state.transfer_meta is not None:
             # Free CPU touch refs
-            self.cpu_block_pool.free_blocks(
+            self._free_cpu_blocks(
                 self.cpu_block_pool.blocks[bid]
                 for bid in state.transfer_meta.cpu_block_ids
             )

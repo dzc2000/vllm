@@ -178,7 +178,6 @@ class BatchMemcpyParams(NamedTuple):
     # 0, which is what ROCm runtimes older than 7.13 require (see
     # _num_attrs_for_hip_version).
     attrs: _CUmemcpyAttributes
-    attrs_idx: ctypes.c_size_t
     num_attrs: int
     # NOTE: cuMemcpyBatchAsync_v2() removed fail_idx field, but we use
     # cuMemcpyBatchAsync() with fail_idx for backward compatibility
@@ -217,19 +216,54 @@ def build_params(
         bpb=np.array(bpb, dtype=np.uint64),
         num_layers=len(src_tensors),
         attrs=attrs,
-        attrs_idx=ctypes.c_size_t(0),
         num_attrs=num_attrs,
         fail_idx=ctypes.c_size_t(0),
         stream_handle=stream.cuda_stream,
     )
 
 
+def _coalesce_runs(
+    src_ids: np.ndarray, dst_ids: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find runs where src AND dst block ids are both ascending by 1.
+
+    Returns (starts, lengths) as int64 arrays: src_ids[starts[k] : starts[k]
+    + lengths[k]] and dst_ids[same slice] are both contiguous ascending, so the
+    whole run can be submitted as ONE memcpy descriptor of
+    ``lengths[k] * bytes_per_block`` bytes.
+
+    This is the KVLog layout->bandwidth exchange: segment-style allocation
+    makes (src, dst) runs long, and coalescing turns each run into a single
+    large DMA instead of per-64KiB descriptors.
+    """
+    n = len(src_ids)
+    if n == 0:
+        return (
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int64),
+        )
+    cont = (src_ids[1:] == src_ids[:-1] + 1) & (dst_ids[1:] == dst_ids[:-1] + 1)
+    breaks = np.nonzero(~cont)[0] + 1
+    starts = np.concatenate(([0], breaks)).astype(np.int64)
+    ends = np.concatenate((breaks, [n])).astype(np.int64)
+    return starts, ends - starts
+
+
 def copy_blocks(
     src_block_ids: list[int],
     dst_block_ids: list[int],
     params: BatchMemcpyParams,
+    coalesce: bool = False,
 ) -> None:
-    """Copy blocks via cuMemcpyBatchAsync / hipMemcpyBatchAsync."""
+    """Copy blocks via cuMemcpyBatchAsync / hipMemcpyBatchAsync.
+
+    Args:
+        coalesce: Merge runs where src and dst ids are both contiguous into
+            single large descriptors. Requires a segment-style layout to pay
+            off (free-queue layout yields ~no runs). Correct for any layout:
+            merging only changes descriptor granularity, never the bytes
+            moved or the mapping.
+    """
     n = len(src_block_ids)
     if n == 0:
         return
@@ -240,14 +274,27 @@ def copy_blocks(
     src_ids = np.array(src_block_ids, dtype=np.uint64)
     dst_ids = np.array(dst_block_ids, dtype=np.uint64)
 
-    src_all = (
-        params.src_bases[:, None] + src_ids[None, :] * params.bpb[:, None]
-    ).ravel()
-    dst_all = (
-        params.dst_bases[:, None] + dst_ids[None, :] * params.bpb[:, None]
-    ).ravel()
-    sz_all = np.repeat(params.bpb, n)
-    total = n * params.num_layers
+    if coalesce:
+        starts, lens = _coalesce_runs(src_ids, dst_ids)
+        # [num_layers, num_runs] descriptor arrays; uint64 throughout to avoid
+        # int64*uint64 promoting to float64 (pointer corruption).
+        src_all = (
+            params.src_bases[:, None] + src_ids[None, starts] * params.bpb[:, None]
+        ).ravel()
+        dst_all = (
+            params.dst_bases[:, None] + dst_ids[None, starts] * params.bpb[:, None]
+        ).ravel()
+        sz_all = (lens[None, :].astype(np.uint64) * params.bpb[:, None]).ravel()
+        total = len(starts) * params.num_layers
+    else:
+        src_all = (
+            params.src_bases[:, None] + src_ids[None, :] * params.bpb[:, None]
+        ).ravel()
+        dst_all = (
+            params.dst_bases[:, None] + dst_ids[None, :] * params.bpb[:, None]
+        ).ravel()
+        sz_all = np.repeat(params.bpb, n)
+        total = n * params.num_layers
 
     # Chunk on ROCm: hipMemcpyBatchAsync faults above 8192 descriptors/call.
     # CUDA is uncapped (max_desc == 0) and issues a single call.
@@ -255,13 +302,19 @@ def copy_blocks(
     step = total if max_desc <= 0 else max_desc
     for off in range(0, total, step):
         cnt = min(step, total - off)
+        # attrIdxs must hold one index per descriptor (cnt entries). Passing a
+        # single size_t only covers the first descriptor and leaves the driver
+        # reading past it (undefined behavior that happens to work when the
+        # adjacent heap memory reads as zero). All-zero = every descriptor
+        # uses attrs[0].
+        attr_idxs = np.zeros(cnt, dtype=np.uint64)
         err = fn(
             dst_all[off : off + cnt].ctypes.data,
             src_all[off : off + cnt].ctypes.data,
             sz_all[off : off + cnt].ctypes.data,
             cnt,
             ctypes.addressof(params.attrs),
-            ctypes.byref(params.attrs_idx),
+            attr_idxs.ctypes.data,
             params.num_attrs,
             ctypes.byref(params.fail_idx),
             params.stream_handle,
