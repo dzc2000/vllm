@@ -172,7 +172,15 @@ def _num_attrs_for_hip_version(version: int) -> int:
 class BatchMemcpyParams(NamedTuple):
     src_bases: np.ndarray  # [num_layers] uint64 — data_ptr per layer
     dst_bases: np.ndarray  # [num_layers] uint64
-    bpb: np.ndarray  # [num_layers] uint64 — bytes per block
+    # Per-layer strides (bytes) for src/dst addressing. Equal for the plain
+    # GPU<->per-tensor-buffer case; differ when one side is an interleaved
+    # staging buffer (slot-major layout, stride = total_block_bytes).
+    src_bpb: np.ndarray  # [num_layers] uint64
+    dst_bpb: np.ndarray  # [num_layers] uint64
+    # Per-layer actual bytes copied per block. Equals both strides in the
+    # equal-stride case; with an interleaved side it is the real per-tensor
+    # block size (the interleaved stride only affects addressing).
+    sizes: np.ndarray  # [num_layers] uint64
     num_layers: int
     # One attributes entry carrying srcAccessOrder. Ignored when num_attrs is
     # 0, which is what ROCm runtimes older than 7.13 require (see
@@ -190,7 +198,15 @@ def build_params(
     dst_caches: dict[str, torch.Tensor],
     stream: torch.cuda.Stream,
     src_access_order: int = CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+    copy_sizes: list[int] | None = None,
 ) -> BatchMemcpyParams:
+    """Build DMA params; src and dst may have different per-layer strides.
+
+    ``copy_sizes`` overrides the per-block copy size (bytes) when the two
+    sides use different strides — required when one side is an interleaved
+    staging buffer whose stride (total_block_bytes) exceeds the real
+    per-tensor block size. Defaults to the common equal-stride size.
+    """
     global _batch_memcpy
     if _batch_memcpy is None:
         _batch_memcpy = _resolve_batch_memcpy()
@@ -200,20 +216,37 @@ def build_params(
     src_tensors = list(src_caches.values())
     dst_tensors = list(dst_caches.values())
 
-    src_bases, dst_bases, bpb = [], [], []
+    src_bases, dst_bases, src_bpb, dst_bpb, sizes = [], [], [], [], []
     for s, d in zip(src_tensors, dst_tensors):
         s_bpb = s.stride(0) * s.element_size()
-        assert s_bpb == d.stride(0) * d.element_size()
+        d_bpb = d.stride(0) * d.element_size()
+        if copy_sizes is None:
+            assert s_bpb == d_bpb, (
+                f"stride mismatch (src={s_bpb}, dst={d_bpb}) requires "
+                "explicit copy_sizes"
+            )
+            sz = s_bpb
+        else:
+            sz = copy_sizes[len(sizes)]
         src_bases.append(s.data_ptr())
         dst_bases.append(d.data_ptr())
-        bpb.append(s_bpb)
+        src_bpb.append(s_bpb)
+        dst_bpb.append(d_bpb)
+        sizes.append(sz)
+    if copy_sizes is not None:
+        assert len(copy_sizes) == len(src_tensors), (
+            f"copy_sizes has {len(copy_sizes)} entries for "
+            f"{len(src_tensors)} tensors"
+        )
 
     attrs = _CUmemcpyAttributes(srcAccessOrder=src_access_order)
 
     return BatchMemcpyParams(
         src_bases=np.array(src_bases, dtype=np.uint64),
         dst_bases=np.array(dst_bases, dtype=np.uint64),
-        bpb=np.array(bpb, dtype=np.uint64),
+        src_bpb=np.array(src_bpb, dtype=np.uint64),
+        dst_bpb=np.array(dst_bpb, dtype=np.uint64),
+        sizes=np.array(sizes, dtype=np.uint64),
         num_layers=len(src_tensors),
         attrs=attrs,
         num_attrs=num_attrs,
@@ -274,26 +307,34 @@ def copy_blocks(
     src_ids = np.array(src_block_ids, dtype=np.uint64)
     dst_ids = np.array(dst_block_ids, dtype=np.uint64)
 
-    if coalesce:
+    # Descriptor merging is only valid when both sides are data-contiguous
+    # (stride == copy size). With an interleaved staging side the stride is
+    # total_block_bytes != size, so a merged descriptor would copy other
+    # tensors' bytes — fall back to per-block descriptors there.
+    mergeable = bool(
+        np.array_equal(params.src_bpb, params.sizes)
+        and np.array_equal(params.dst_bpb, params.sizes)
+    )
+    if coalesce and mergeable:
         starts, lens = _coalesce_runs(src_ids, dst_ids)
         # [num_layers, num_runs] descriptor arrays; uint64 throughout to avoid
         # int64*uint64 promoting to float64 (pointer corruption).
         src_all = (
-            params.src_bases[:, None] + src_ids[None, starts] * params.bpb[:, None]
+            params.src_bases[:, None] + src_ids[None, starts] * params.src_bpb[:, None]
         ).ravel()
         dst_all = (
-            params.dst_bases[:, None] + dst_ids[None, starts] * params.bpb[:, None]
+            params.dst_bases[:, None] + dst_ids[None, starts] * params.dst_bpb[:, None]
         ).ravel()
-        sz_all = (lens[None, :].astype(np.uint64) * params.bpb[:, None]).ravel()
+        sz_all = (lens[None, :].astype(np.uint64) * params.sizes[:, None]).ravel()
         total = len(starts) * params.num_layers
     else:
         src_all = (
-            params.src_bases[:, None] + src_ids[None, :] * params.bpb[:, None]
+            params.src_bases[:, None] + src_ids[None, :] * params.src_bpb[:, None]
         ).ravel()
         dst_all = (
-            params.dst_bases[:, None] + dst_ids[None, :] * params.bpb[:, None]
+            params.dst_bases[:, None] + dst_ids[None, :] * params.dst_bpb[:, None]
         ).ravel()
-        sz_all = np.repeat(params.bpb, n)
+        sz_all = np.repeat(params.sizes, n)
         total = n * params.num_layers
 
     # Chunk on ROCm: hipMemcpyBatchAsync faults above 8192 descriptors/call.

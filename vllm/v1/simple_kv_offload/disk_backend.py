@@ -35,8 +35,6 @@ _ALIGNMENT = 4096
 # Default coalesced-I/O group size: one full pwritev/preadv per contiguous run
 # chunk of up to this many bytes (16 MiB @ 64 KiB blocks = 256 slots).
 _DEFAULT_SEGMENT_BYTES = 16 * (1024**2)
-# os.pwritev/preadv accept at most IOV_MAX (1024) iov entries per call.
-_IOV_MAX = 1024
 
 
 def _find_runs(blocks: list[int]) -> list[tuple[int, int]]:
@@ -58,17 +56,16 @@ def _find_runs(blocks: list[int]) -> list[tuple[int, int]]:
     return runs
 
 
-def _alloc_aligned(num_slots: int, bpb: int) -> torch.Tensor:
-    """Allocate a staging buffer whose base address is O_DIRECT aligned.
+def _alloc_aligned_flat(nbytes: int) -> torch.Tensor:
+    """Allocate a flat staging buffer whose base address is O_DIRECT aligned.
 
     The CPU allocator only guarantees 64-byte alignment, so over-allocate by
     one alignment unit and return an aligned view. The view keeps the backing
     storage alive.
     """
-    nbytes = num_slots * bpb
     raw = torch.zeros(nbytes + _ALIGNMENT, dtype=torch.int8, device="cpu")
     offset = -raw.data_ptr() % _ALIGNMENT
-    return raw[offset : offset + nbytes].view(num_slots, bpb)
+    return raw[offset : offset + nbytes]
 
 
 class DiskBackend:
@@ -98,8 +95,8 @@ class DiskBackend:
         self._total_block_bytes: int = 0
         self._store_buffer_caches: dict[str, torch.Tensor] = {}
         self._load_buffer_caches: dict[str, torch.Tensor] = {}
-        self._store_slot_views: list[list[memoryview]] = []
-        self._load_slot_views: list[list[memoryview]] = []
+        self._store_slot_views: list[memoryview] = []
+        self._load_slot_views: list[memoryview] = []
         self._per_tensor_bpb: list[int] = []
         self._tensor_names: list[str] = []
         # KVLog M3 阶段一：run 合并 I/O。>0 表示合并路径的每半缓冲 slot 数。
@@ -124,11 +121,11 @@ class DiskBackend:
         self._total_block_bytes = total_block_bytes
         self._tensor_names = list(gpu_caches.keys())
         if coalesce_io:
-            # 组缓冲（段级双缓冲）：每半缓冲容纳 segment_bytes 的连续 slot，
-            # 受 IOV_MAX/每 slot iov 条目数上限约束。
+            # 组缓冲（段级双缓冲）：每半缓冲容纳 segment_bytes 的连续 slot。
+            # 阶段 1.5：交错暂存缓冲使每个 chunk 只需 1 条 iov，
+            # IOV_MAX 不再约束 chunk 上限，segment_bytes 可超 16 MiB。
             seg_slots = max(1, -(-segment_bytes // total_block_bytes))
-            iov_cap = max(1, _IOV_MAX // max(1, len(gpu_caches)))
-            self._coalesce_half = min(seg_slots, iov_cap)
+            self._coalesce_half = seg_slots
             num_buffer_slots = max(num_buffer_slots, 2 * self._coalesce_half)
         self._num_buffer_slots = num_buffer_slots
         self._per_tensor_bpb = [
@@ -139,32 +136,52 @@ class DiskBackend:
             f"total_block_bytes={total_block_bytes} not aligned to {_ALIGNMENT}"
         )
 
-        # Separate buffer pools for store and load threads
+        # 阶段 1.5 交错暂存缓冲：store/load 各一块连续内存，slot 内张量
+        # 布局与磁盘一致（t0b0..tNb0, t0b1..tNb1, ...），因此任意连续 k 个
+        # slot 在内存与磁盘上都是连续区段 -> 1 条 iov、1 次 syscall。
+        # DMA 侧用 as_strided 按张量切视图（stride=total_block_bytes），
+        # copy_blocks 按双侧 stride 寻址、逐块描述符搬运。
+        assert sum(self._per_tensor_bpb) == total_block_bytes, (
+            "total_block_bytes must equal the sum of per-tensor block bytes"
+        )
+        buf_bytes = num_buffer_slots * total_block_bytes
+        store_flat = _alloc_aligned_flat(buf_bytes)
+        load_flat = _alloc_aligned_flat(buf_bytes)
+        pin_tensor(store_flat)
+        pin_tensor(load_flat)
+        self._store_flat = store_flat
+        self._load_flat = load_flat
+        self._store_np = store_flat.numpy()
+        self._load_np = load_flat.numpy()
+
+        # as_strided 的 storage_offset 是底层存储的绝对偏移，需加上对齐
+        # 视图自身的偏移。
+        store_off = store_flat.storage_offset()
+        load_off = load_flat.storage_offset()
         self._store_buffer_caches = {}
         self._load_buffer_caches = {}
+        off = 0
         for name, gpu_t in gpu_caches.items():
             bpb = gpu_t.stride(0) * gpu_t.element_size()
-            store_buf = _alloc_aligned(num_buffer_slots, bpb)
-            pin_tensor(store_buf)
-            self._store_buffer_caches[name] = store_buf
-            load_buf = _alloc_aligned(num_buffer_slots, bpb)
-            pin_tensor(load_buf)
-            self._load_buffer_caches[name] = load_buf
+            self._store_buffer_caches[name] = torch.as_strided(
+                store_flat, (num_buffer_slots, bpb),
+                (total_block_bytes, 1), store_off + off,
+            )
+            self._load_buffer_caches[name] = torch.as_strided(
+                load_flat, (num_buffer_slots, bpb),
+                (total_block_bytes, 1), load_off + off,
+            )
+            off += bpb
 
-        # Pre-built iovec views per slot (avoid per-transfer .numpy() calls)
+        # 每 slot 单条 iov（slot 在交错缓冲中连续）
+        ttb = total_block_bytes
         self._store_slot_views = [
-            [
-                memoryview(self._store_buffer_caches[name][slot].numpy())
-                for name in self._tensor_names
-            ]
-            for slot in range(num_buffer_slots)
+            memoryview(self._store_np[s * ttb : (s + 1) * ttb])
+            for s in range(num_buffer_slots)
         ]
         self._load_slot_views = [
-            [
-                memoryview(self._load_buffer_caches[name][slot].numpy())
-                for name in self._tensor_names
-            ]
-            for slot in range(num_buffer_slots)
+            memoryview(self._load_np[s * ttb : (s + 1) * ttb])
+            for s in range(num_buffer_slots)
         ]
 
         self._store_params = build_params(
@@ -172,12 +189,14 @@ class DiskBackend:
             self._store_buffer_caches,
             store_stream,
             src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+            copy_sizes=self._per_tensor_bpb,
         )
         self._load_params = build_params(
             self._load_buffer_caches,
             gpu_caches,
             load_stream,
             src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+            copy_sizes=self._per_tensor_bpb,
         )
 
         os.makedirs(os.path.dirname(disk_path) or ".", exist_ok=True)
@@ -294,7 +313,9 @@ class DiskBackend:
             events_list.append((event_idx, event))
 
     def _writev_slot(self, buf_slot: int, file_offset: int) -> None:
-        written = os.pwritev(self._fd, self._store_slot_views[buf_slot], file_offset)
+        written = os.pwritev(
+            self._fd, [self._store_slot_views[buf_slot]], file_offset
+        )
         if written < self._total_block_bytes:
             raise OSError(
                 f"Short write: expected {self._total_block_bytes} bytes, "
@@ -304,7 +325,9 @@ class DiskBackend:
             profiler.note_syscalls("store", written)
 
     def _readv_slot(self, buf_slot: int, file_offset: int) -> None:
-        bytes_read = os.preadv(self._fd, self._load_slot_views[buf_slot], file_offset)
+        bytes_read = os.preadv(
+            self._fd, [self._load_slot_views[buf_slot]], file_offset
+        )
         if bytes_read < self._total_block_bytes:
             raise OSError(
                 f"Short read: expected {self._total_block_bytes} bytes, "
@@ -314,12 +337,16 @@ class DiskBackend:
             profiler.note_syscalls("load", bytes_read)
 
     def _writev_range(self, buf_start: int, k: int, file_offset: int) -> None:
-        """一次 pwritev 写出连续 k 个缓冲 slot（对应磁盘上的一段连续 run）。"""
-        views: list[memoryview] = []
-        for slot in range(buf_start, buf_start + k):
-            views.extend(self._store_slot_views[slot])
-        nbytes = k * self._total_block_bytes
-        written = os.pwritev(self._fd, views, file_offset)
+        """一次 pwritev 写出连续 k 个缓冲 slot（对应磁盘上的一段连续 run）。
+
+        交错暂存缓冲下连续 k 个 slot 是单块连续内存 -> 1 条 iov。
+        """
+        ttb = self._total_block_bytes
+        nbytes = k * ttb
+        view = memoryview(
+            self._store_np[buf_start * ttb : buf_start * ttb + nbytes]
+        )
+        written = os.pwritev(self._fd, [view], file_offset)
         if written < nbytes:
             raise OSError(
                 f"Short write: expected {nbytes} bytes, wrote {written}"
@@ -329,11 +356,12 @@ class DiskBackend:
 
     def _readv_range(self, buf_start: int, k: int, file_offset: int) -> None:
         """一次 preadv 读入连续 k 个缓冲 slot（磁盘上一段连续 run）。"""
-        views: list[memoryview] = []
-        for slot in range(buf_start, buf_start + k):
-            views.extend(self._load_slot_views[slot])
-        nbytes = k * self._total_block_bytes
-        bytes_read = os.preadv(self._fd, views, file_offset)
+        ttb = self._total_block_bytes
+        nbytes = k * ttb
+        view = memoryview(
+            self._load_np[buf_start * ttb : buf_start * ttb + nbytes]
+        )
+        bytes_read = os.preadv(self._fd, [view], file_offset)
         if bytes_read < nbytes:
             raise OSError(
                 f"Short read: expected {nbytes} bytes, read {bytes_read}"
@@ -425,7 +453,8 @@ class DiskBackend:
                 gpu_blocks[idx0 : idx0 + k],
                 list(range(buf_start, buf_start + k)),
                 self._store_params,
-                coalesce=True,
+                # 交错缓冲 stride != size，描述符合并恒不适用，逐块搬运
+                coalesce=False,
             )
             if prof:
                 dma_t += profiler.now() - ts
@@ -586,7 +615,8 @@ class DiskBackend:
                 list(range(buf_start, buf_start + k)),
                 gpu_blocks[idx0 : idx0 + k],
                 self._load_params,
-                coalesce=True,
+                # 交错缓冲 stride != size，描述符合并恒不适用，逐块搬运
+                coalesce=False,
             )
             if prof:
                 dma_t += profiler.now() - ts
