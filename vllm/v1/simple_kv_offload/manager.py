@@ -93,6 +93,8 @@ class _DiskSegmentAllocator:
         self._seg_free: list[bool] = [True] * self._num_segs
         self._active: int = -1
         self._off: int = 0
+        # 阶段二段亲和：req_key -> (最近分配的段, 段内下一偏移)
+        self._affinity: dict[str, tuple[int, int]] = {}
         # 观测计数（段利用率计量用）
         self.num_taken: int = 0
         self.num_segments_recycled: int = 0
@@ -133,6 +135,53 @@ class _DiskSegmentAllocator:
             seg = self._active
             self._active = -1
             self._try_recycle(seg)
+
+    def take_block_affinity(self, req_key: str) -> "KVCacheBlock | None":
+        """阶段二段亲和分配：同 req_key 的块优先聚到其上次分配的段。
+
+        lazy 模式下多请求交错调用 take_block 会把段内连续性切碎
+        （§3.7：74.6% 单块 run）。此变体为每个 req_key 记住最近分配的
+        （段, 段内偏移），后续同 key 的块优先回到该段继续 bump——
+        段内空洞（被其他请求占用/pin 的 slot）自然跳过，块间连续性
+        尽力保持。耗尽或段被回收时回退到 take_block 的全局 bump。
+        """
+        blk = self._take_from_affinity(req_key)
+        if blk is not None:
+            self.num_taken += 1
+            return blk
+        return self.take_block()
+
+    def _take_from_affinity(self, req_key: str) -> "KVCacheBlock | None":
+        """尝试从 req_key 的亲和段内取块；段满/无效时清除亲和返回 None。"""
+        state = self._affinity.get(req_key)
+        if state is None:
+            return None
+        seg, off = state
+        base = seg * self._seg_size
+        if seg >= self._num_segs or self._seg_free[seg]:
+            # 段已被整体回收（或越界），亲和失效
+            self._affinity.pop(req_key, None)
+            return None
+        pool = self._pool
+        while off < self._seg_size:
+            bid = base + off
+            off += 1
+            if bid >= self._num_slots:
+                break
+            blk = self._blocks[bid]
+            if blk.is_null or blk.ref_cnt != 0:
+                continue
+            pool.free_block_queue.remove(blk)
+            if pool.enable_caching:
+                pool._maybe_evict_cached_block(blk)
+            blk.ref_cnt += 1
+            if pool.metrics_collector is not None:
+                pool.metrics_collector.on_block_allocated(blk)
+            self._affinity[req_key] = (seg, off)
+            return blk
+        # 亲和段已满：清除亲和，回退全局 bump（会开新段并重建亲和）
+        self._affinity.pop(req_key, None)
+        return None
 
     def _try_recycle(self, seg: int) -> None:
         """段内全部 slot 空闲（ref_cnt==0 或 null）时归还段空闲列表尾部。"""
@@ -613,8 +662,10 @@ class SimpleCPUOffloadScheduler:
                 and cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is None
             ):
                 if seg_alloc is not None:
-                    # 段式分配：逐块 bump 出连续 disk slot（耗尽即止）
-                    cpu_blk = seg_alloc.take_block()
+                    # 阶段二段亲和：GPU 块 id 邻近（同请求/同前缀落同 GPU 段）
+                    # 时聚到同磁盘段，保持 run 连续性；否则回退全局 bump
+                    aff_key = f"g{node.block_id // 32}"
+                    cpu_blk = seg_alloc.take_block_affinity(aff_key)
                     if cpu_blk is None:
                         break
                     cpu_blocks.append(cpu_blk)
@@ -739,8 +790,9 @@ class SimpleCPUOffloadScheduler:
                         continue
 
                     if seg_alloc is not None:
-                        # 段式分配：逐块 bump 出连续 disk slot（耗尽即 out_of_space）
-                        cpu_blk = seg_alloc.take_block()
+                        # 阶段二段亲和：同请求块聚同段（GPU 块 id 邻近为 key）
+                        aff_key = f"g{gpu_block_id // 32}"
+                        cpu_blk = seg_alloc.take_block_affinity(aff_key)
                         if cpu_blk is None:
                             out_of_space = True
                             break

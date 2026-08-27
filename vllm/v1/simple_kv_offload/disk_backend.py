@@ -56,6 +56,29 @@ def _find_runs(blocks: list[int]) -> list[tuple[int, int]]:
     return runs
 
 
+_SEGMENT_SIZE = 32  # 与 manager._DiskSegmentAllocator 保持一致
+
+
+def _reorder_by_segment(
+    gpu_blocks: list[int], disk_slots: list[int]
+) -> tuple[list[int], list[int], list[int]]:
+    """阶段二：store 前按磁盘段分组重排 (gpu, slot) 对。
+
+    多请求交错提交时 slot 序列跨段跳动（§3.7：74.6% 单块 run），但每对
+    (gpu, slot) 落盘互不依赖——重排仅改变 DMA/写盘顺序，不改数据归属。
+    按 ``slot // 32`` 聚类 + 段内排序后，同段 slot 变成连续 run，让
+    pwritev 合并成段粒度大 I/O。
+
+    返回 (重排后 gpu_blocks, 重排后 disk_slots, 旧索引->新索引映射)。
+    映射保留供调用方对齐 store 事件回调里的块序（当前实现按对整体完成，
+    无逐块回调，返回仅为可观测性）。
+    """
+    order = sorted(range(len(disk_slots)), key=lambda i: disk_slots[i])
+    new_gpu = [gpu_blocks[i] for i in order]
+    new_slots = [disk_slots[i] for i in order]
+    return new_gpu, new_slots, order
+
+
 def _alloc_aligned_flat(nbytes: int) -> torch.Tensor:
     """Allocate a flat staging buffer whose base address is O_DIRECT aligned.
 
@@ -418,6 +441,10 @@ class DiskBackend:
         段级双缓冲（两半组缓冲轮换）：先发本 chunk DMA，再等上一 chunk 的
         DMA 事件并落盘，使 DMA 与磁盘 I/O 流水重叠。块粒度上 syscall 数
         从 N 次 pwritev 降为 run-chunk 数。
+
+        阶段二：提交时先按磁盘段重排 (gpu, slot) 对——多请求交错提交的
+        slot 序列跨段跳动，但落盘互不依赖，段序重排让 run 合并看到
+        段粒度的连续 slot（§3.7 的 74.6% 单块 run 主要来自交错而非空洞）。
         """
         assert self._store_params is not None
         half = self._coalesce_half
@@ -425,6 +452,9 @@ class DiskBackend:
         prof = profiler.PROFILE
         t0 = profiler.now() if prof else 0.0
         io_t = sync_t = dma_t = 0.0
+
+        # 阶段二：段序重排（O(n log n)，纯 Python，~4 万块 < 10ms）
+        gpu_blocks, disk_slots, _ = _reorder_by_segment(gpu_blocks, disk_slots)
 
         # (gpu 起始索引, 磁盘起始 slot, 块数)：run × chunk 展开
         ops: list[tuple[int, int, int]] = []
