@@ -53,6 +53,29 @@ _io_stats: dict[str, dict[str, float]] = {
 }
 
 
+# run 长度直方图（仅合并路径采集）：解释 syscall 粒度来源。
+# run = 磁盘 slot 连续段（分配器决定的原始可合并性）；
+# chunk = 实际 syscall 单元（run 按 half 上限切块后）。
+# 两者分布分开记：run 短 => 段式分配被打断（写路径问题）；
+# run 长但 chunk 短 => 组缓冲上限截断（可调 disk_segment_bytes）。
+_run_stats: dict[str, dict] = {
+    d: {
+        "runs_hist": {},  # 桶(bit_length) -> run 个数
+        "chunks_hist": {},  # 桶 -> chunk（=syscall）个数
+        "runs": 0,
+        "run_blocks": 0,
+        "chunks": 0,
+        "chunk_blocks": 0,
+    }
+    for d in ("store", "load")
+}
+
+
+def _bucket(length: int) -> int:
+    # 1->1, 2-3->2, 4-7->3, 8-15->4 ... 指数桶，键稳定可 JSON 化
+    return max(1, int(length)).bit_length()
+
+
 # worker 侧时间序列（截断保护，避免长跑撑爆内存）
 _MAX_SERIES = 200_000
 _load_events: list[list[float]] = []  # [submit_ts, done_ts]
@@ -85,6 +108,25 @@ def note_syscalls(direction: str, nbytes: int) -> None:
         s = _io_stats[direction]
         s["syscalls"] += 1
         s["bytes"] += nbytes
+
+
+def note_runs(direction: str, run_lengths: list[int],
+              chunk_lengths: list[int]) -> None:
+    """记录一批传输的 run/chunk 长度分布（合并路径专用）。"""
+    if not PROFILE:
+        return
+    with _lock:
+        rs = _run_stats[direction]
+        for length in run_lengths:
+            b = _bucket(length)
+            rs["runs_hist"][b] = rs["runs_hist"].get(b, 0) + 1
+            rs["runs"] += 1
+            rs["run_blocks"] += length
+        for length in chunk_lengths:
+            b = _bucket(length)
+            rs["chunks_hist"][b] = rs["chunks_hist"].get(b, 0) + 1
+            rs["chunks"] += 1
+            rs["chunk_blocks"] += length
 
 
 def note_load_event(submit_ts: float, done_ts: float) -> None:
@@ -156,6 +198,17 @@ def _dump() -> None:
                     "pid": os.getpid(),
                     "dump_ts": time.time(),
                     "io": {k: dict(v) for k, v in _io_stats.items()},
+                    "runs": {
+                        k: {
+                            "runs_hist": dict(v["runs_hist"]),
+                            "chunks_hist": dict(v["chunks_hist"]),
+                            "runs": v["runs"],
+                            "run_blocks": v["run_blocks"],
+                            "chunks": v["chunks"],
+                            "chunk_blocks": v["chunk_blocks"],
+                        }
+                        for k, v in _run_stats.items()
+                    },
                     "load_events": _load_events[:_MAX_SERIES],
                     "pending_series": _pending_series[:_MAX_SERIES],
                     "flush": dict(_flush_stats),

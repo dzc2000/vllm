@@ -400,10 +400,17 @@ class DiskBackend:
 
         # (gpu 起始索引, 磁盘起始 slot, 块数)：run × chunk 展开
         ops: list[tuple[int, int, int]] = []
-        for start, length in _find_runs(disk_slots):
+        runs = _find_runs(disk_slots)
+        for start, length in runs:
             for off in range(0, length, half):
                 k = min(half, length - off)
                 ops.append((start + off, disk_slots[start + off], k))
+        if prof:
+            # run/chunk 长度分布：诊断 syscall 粒度（写路径打断 vs 缓冲上限）
+            profiler.note_runs(
+                "store", [length for _, length in runs],
+                [k for _, _, k in ops],
+            )
 
         # (DMA event, buf_start, file_offset, k)：已 DMA 完成待落盘的 chunk
         pending: tuple[torch.Event, int, int, int] | None = None
@@ -544,10 +551,16 @@ class DiskBackend:
 
         # (gpu 起始索引, 磁盘起始 slot, 块数)：run × chunk 展开
         ops: list[tuple[int, int, int]] = []
-        for start, length in _find_runs(disk_slots):
+        runs = _find_runs(disk_slots)
+        for start, length in runs:
             for off in range(0, length, half):
                 k = min(half, length - off)
                 ops.append((start + off, disk_slots[start + off], k))
+        if prof:
+            profiler.note_runs(
+                "load", [length for _, length in runs],
+                [k for _, _, k in ops],
+            )
 
         pending: torch.Event | None = None  # 上一 chunk 的 DMA 事件
         half_idx = 0
