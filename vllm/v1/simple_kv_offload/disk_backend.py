@@ -207,11 +207,24 @@ class DiskBackend:
             for s in range(num_buffer_slots)
         ]
 
+        # KVLog 探针：KVLOG_STORE_SRC_ANY=1 时 store DMA 源访问顺序改 ANY，
+        # 验证 STREAM 语义被前向 kernel 队列阻塞的假说。注意 ANY 仅对
+        # 拷贝期间不再变化的源是安全的（此处探针用途，默认仍 STREAM）。
+        store_src_order = (
+            CU_MEMCPY_SRC_ACCESS_ORDER_ANY
+            if os.environ.get("KVLOG_STORE_SRC_ANY", "0") == "1"
+            else CU_MEMCPY_SRC_ACCESS_ORDER_STREAM
+        )
+        logger.info(
+            "KVLog store DMA src_access_order=%s (KVLOG_STORE_SRC_ANY=%s)",
+            "ANY" if store_src_order == CU_MEMCPY_SRC_ACCESS_ORDER_ANY else "STREAM",
+            os.environ.get("KVLOG_STORE_SRC_ANY", "0"),
+        )
         self._store_params = build_params(
             gpu_caches,
             self._store_buffer_caches,
             store_stream,
-            src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+            src_access_order=store_src_order,
             copy_sizes=self._per_tensor_bpb,
         )
         self._load_params = build_params(
@@ -274,6 +287,24 @@ class DiskBackend:
         q = self._store_queue if is_store else self._load_queue
         q.put((src_blocks, dst_blocks, event_idx, events_list, wait_event))
 
+    def store_barrier(self, timeout: float = 30.0) -> bool:
+        """等 store 线程处理完此前入队的所有任务（含 done 事件注册）。
+
+        队列 FIFO：屏障项排在先入队的批之后，被 store 线程取到并
+        set 时，先期各批的 done 事件必已 append 进 events_list。
+        供抢占 flush 在同步事件前关闭"入队但未注册"的窗口。
+        """
+        ack = threading.Event()
+        self._store_queue.put(ack)
+        if not ack.wait(timeout):
+            logger.warning(
+                "DiskBackend store_barrier timed out after %.0fs "
+                "(store thread dead?)",
+                timeout,
+            )
+            return False
+        return True
+
     def shutdown(self) -> None:
         if self._shutdown:
             return
@@ -319,10 +350,22 @@ class DiskBackend:
             item = self._store_queue.get()
             if item is None:
                 return
+            if isinstance(item, threading.Event):
+                # 队列屏障（store_barrier）：此刻先入队批次的 done 事件
+                # 均已注册，set 放行等待中的 flush。
+                item.set()
+                continue
             (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
             try:
                 if wait_event is not None:
                     stream.wait_event(wait_event)
+                    # 探针：主机侧等 compute_done 的耗时（依赖节拍税），
+                    # 用于把 sync_wall 分解为 dep_wait + dma_wait。
+                    if profiler.PROFILE:
+                        _ts = profiler.now()
+                    wait_event.synchronize()
+                    if profiler.PROFILE:
+                        profiler.note_dep_wait("store", profiler.now() - _ts)
                 self._do_store(src_blocks, dst_blocks, stream)
             except Exception:
                 # 后台线程死亡必须可见，否则表现为 store 计数静默归零

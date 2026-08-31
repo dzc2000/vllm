@@ -78,6 +78,14 @@ def _bucket(length: int) -> int:
 
 # worker 侧时间序列（截断保护，避免长跑撑爆内存）
 _MAX_SERIES = 200_000
+_dep_wait = {"store": 0.0, "load": 0.0}
+
+def note_dep_wait(direction: str, seconds: float) -> None:
+    """等待上游依赖事件（如 compute_done）的主机侧耗时。"""
+    if PROFILE:
+        with _lock:
+            _dep_wait[direction] += seconds
+
 _load_events: list[list[float]] = []  # [submit_ts, done_ts]
 _pending_series: list[list[float]] = []  # [ts, pending_load_events]
 _flush_stats = {"count": 0, "wall_s": 0.0}
@@ -209,13 +217,14 @@ def _dump() -> None:
                         }
                         for k, v in _run_stats.items()
                     },
+                    "dep_wait": dict(_dep_wait),
                     "load_events": _load_events[:_MAX_SERIES],
                     "pending_series": _pending_series[:_MAX_SERIES],
                     "flush": dict(_flush_stats),
                 },
             }
         os.makedirs(os.path.dirname(OUT_PATH) or ".", exist_ok=True)
-        tmp = OUT_PATH + ".tmp"
+        tmp = OUT_PATH + f".tmp.{threading.get_ident()}"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f)
         os.replace(tmp, OUT_PATH)

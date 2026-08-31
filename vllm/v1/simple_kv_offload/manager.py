@@ -3,6 +3,7 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import os
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
@@ -286,7 +287,9 @@ class SimpleCPUOffloadScheduler:
         # KVLog M3 阶段一：磁盘模式下用段式分配器保证 disk slot 物理连续
         # （run 合并 I/O 的前提）。CPU 模式保持原生 free-queue 分配。
         self._disk_seg_alloc: _DiskSegmentAllocator | None = None
-        if disk_capacity_bytes > 0:
+        if disk_capacity_bytes > 0 and os.environ.get(
+            "KVLOG_DISK_SEG_ALLOC", "1"
+        ) != "0":
             self._disk_seg_alloc = _DiskSegmentAllocator(
                 self.cpu_block_pool, self.num_cpu_blocks, segment_size=32
             )

@@ -91,6 +91,25 @@ class DmaCopyBackend:
             )
         )
 
+    def store_barrier(self, timeout: float = 30.0) -> bool:
+        """等 copy 线程处理完此前入队的所有任务（含 done 事件注册）。
+
+        本后端单队列单线程同管 load/store，屏障语义因此更强：先期
+        双向队列项的 done 事件均已注册。供抢占 flush 关闭"入队但
+        未注册"的窗口。
+        """
+        ack = threading.Event()
+        assert self._queue is not None
+        self._queue.put(ack)
+        if not ack.wait(timeout):
+            logger.warning(
+                "DmaCopyBackend store_barrier timed out after %.0fs "
+                "(copy thread dead?)",
+                timeout,
+            )
+            return False
+        return True
+
     def shutdown(self) -> None:
         if self._shutdown:
             return
@@ -112,6 +131,11 @@ class DmaCopyBackend:
             item = q.get()
             if item is None:
                 return
+            if isinstance(item, threading.Event):
+                # 队列屏障（store_barrier）：此刻先入队批次的 done 事件
+                # 均已注册，set 放行等待中的 flush。
+                item.set()
+                continue
             (
                 src_blocks,
                 dst_blocks,

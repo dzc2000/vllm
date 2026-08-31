@@ -43,6 +43,8 @@ DEFAULT_CPU_CAPACITY_BYTES = 8 * (1024**3)
 
 VALID_KV_OFFLOAD_BACKENDS = ("cpu", "disk")
 # Keys that only apply to the disk backend, warned about under "cpu".
+# 注意：lag_store_steps 不在列表内——滞后 store 修的是 store 线程等
+# compute_done 的依赖节拍税，CPU-DMA 与磁盘两条路径同样存在。
 _DISK_ONLY_KEYS = (
     "disk_path",
     "disk_capacity_bytes",
@@ -113,6 +115,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         disk_segment_bytes = int(
             extra_config.get("disk_segment_bytes", 16 * (1024**2))
         )
+        # KVLog 第二步（滞后 store）：store 批滞后 N 步提交，解除依赖
+        # 节拍税（§4.6）。0 = 原生行为（A/B 基线）；1 = 纯滞后一步；
+        # >=2 = 跨步攒批（多步批合并提交，摊薄交错碎片）。
+        lag_store_steps = int(extra_config.get("lag_store_steps", 0))
 
         # KVLog profiling：环境变量在 EngineCore 子进程中不可靠，
         # 经 extra_config（随 VllmConfig 序列化传递）激活是可靠路径。
@@ -156,13 +162,15 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
 
         logger.info(
             "SimpleCPUOffloadConnector: role=%s, "
-            "per_rank=%.2f GB, world_size=%d, mode=%s, backend=%s, disk=%s",
+            "per_rank=%.2f GB, world_size=%d, mode=%s, backend=%s, disk=%s, "
+            "lag_store_steps=%d",
             role.name,
             cpu_capacity_per_rank / (1024**3),
             world_size,
             "lazy" if lazy_offload else "eager",
             kv_offload_backend,
             disk_path or "none",
+            lag_store_steps,
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -193,6 +201,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 use_page_cache=use_page_cache,
                 disk_coalesce_io=disk_coalesce_io,
                 disk_segment_bytes=disk_segment_bytes,
+                lag_store_steps=lag_store_steps,
             )
 
     # --- Worker-side methods ---

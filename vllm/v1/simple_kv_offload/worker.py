@@ -39,6 +39,7 @@ class SimpleCPUOffloadWorker:
         use_page_cache: bool = False,
         disk_coalesce_io: bool = True,
         disk_segment_bytes: int = 16 * (1024**2),
+        lag_store_steps: int = 0,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -50,6 +51,16 @@ class SimpleCPUOffloadWorker:
         self.disk_coalesce_io = disk_coalesce_io
         self.disk_segment_bytes = disk_segment_bytes
         self.disk_mode = kv_offload_backend == "disk"
+        # KVLog 第二步（滞后 store）：>0 时 store 批滞后 N 步提交（§4.6
+        # 依赖节拍税的修复）。lag=1 为纯滞后；lag>=2 为跨步攒批（多步
+        # 批合并为单批提交，同时摊薄交错碎片）。0 = 原生行为（A/B 基线）。
+        self._lag_store_steps = max(0, int(lag_store_steps))
+        # 持有中的滞后 store 批：(gpu_blocks, cpu_blocks, event_idx,
+        # compute_done_event)。触发提交时只 flush 老化批并合并为单批，
+        # 本步刚录事件的最新一批扣住不交（keep=1）。
+        self._lagged_batches: list[
+            tuple[list[int], list[int], int, torch.Event]
+        ] = []
 
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
@@ -277,17 +288,40 @@ class SimpleCPUOffloadWorker:
                     events_list=self._load_events,
                 )
             if metadata.store_gpu_blocks:
-                if self._store_compute_done is None:
-                    self._store_compute_done = torch.Event()
-                self._store_compute_done.record(torch.cuda.current_stream())
-                backend.launch_copy(
-                    metadata.store_gpu_blocks,
-                    metadata.store_cpu_blocks,
-                    is_store=True,
-                    event_idx=metadata.store_event,
-                    events_list=self._store_events,
-                    wait_event=self._store_compute_done,
-                )
+                if self._lag_store_steps > 0:
+                    # 滞后 store：每步新建 Event——持有跨步，不能复用
+                    # self._store_compute_done（下一步 record 会重写同一
+                    # Event，clobber 掉持有批的依赖）。
+                    ev = torch.Event()
+                    ev.record(torch.cuda.current_stream())
+                    self._lagged_batches.append(
+                        (
+                            metadata.store_gpu_blocks,
+                            metadata.store_cpu_blocks,
+                            metadata.store_event,
+                            ev,
+                        )
+                    )
+                    if len(self._lagged_batches) > self._lag_store_steps:
+                        # 只提交老化批：wait_event 必须至少滞后一步，否则
+                        # store 线程仍等本步 forward，dep_wait 不会坍缩。
+                        self._submit_lagged(backend, keep=1)
+                else:
+                    if self._store_compute_done is None:
+                        self._store_compute_done = torch.Event()
+                    self._store_compute_done.record(torch.cuda.current_stream())
+                    backend.launch_copy(
+                        metadata.store_gpu_blocks,
+                        metadata.store_cpu_blocks,
+                        is_store=True,
+                        event_idx=metadata.store_event,
+                        events_list=self._store_events,
+                        wait_event=self._store_compute_done,
+                    )
+            elif self._lagged_batches:
+                # 本步无新 store：立即排空持有批（步间隙/尾部排空，
+                # 避免最后一批滞留到引擎关闭）
+                self._submit_lagged(backend)
 
         # (2) Track completed transfer events
         finished_recving: set[str] = set()
@@ -323,6 +357,47 @@ class SimpleCPUOffloadWorker:
         self._completed_store_events = {}
         return meta
 
+    def _submit_lagged(
+        self, backend: DmaCopyBackend | DiskBackend, keep: int = 0
+    ) -> None:
+        """提交持有中的滞后 store 批（老化批合并为单批提交）。
+
+        keep>0 时扣住最新 keep 批不提交：其 compute_done 是本步刚录的
+        事件，若随批交出，store 线程仍要等本步 forward 跑完——与原生
+        路径同样的依赖节拍税。只提交至少滞后一步的老化批，提交时刻
+        事件通常已完成，dep_wait 才可能坍缩（RQ3b 锚点）。
+
+        合并批的 wait_event 取被提交批中最后一个：compute 流按序执行，
+        后录事件蕴含此前全部依赖，一次等待覆盖所有被提交批。event_idx
+        取被提交批的最大值：store 完成回报按水位（hwm）推进，完成时
+        所有 <= 水位的 pending 索引一并标记完成，调度侧块释放语义不变。
+
+        正确性：滞后只推迟搬运时机，不改数据所有权——块释放本就门在
+        store 完成回执上，持有期间不会被复用；代价是换出窗口内 KV
+        驻留 GPU 多 lag_store_steps 步（内存压力场景需评估，RQ4 消融）。
+        """
+        if keep >= len(self._lagged_batches):
+            return
+        flush = self._lagged_batches[: len(self._lagged_batches) - keep]
+        self._lagged_batches = self._lagged_batches[
+            len(self._lagged_batches) - keep :
+        ]
+        if len(flush) == 1:
+            gpu_blocks, cpu_blocks, event_idx, ev = flush[0]
+        else:
+            gpu_blocks = [b for bs, _, _, _ in flush for b in bs]
+            cpu_blocks = [s for _, ss, _, _ in flush for s in ss]
+            event_idx = flush[-1][2]
+            ev = flush[-1][3]
+        backend.launch_copy(
+            gpu_blocks,
+            cpu_blocks,
+            is_store=True,
+            event_idx=event_idx,
+            events_list=self._store_events,
+            wait_event=ev,
+        )
+
     def handle_preemptions(
         self, kv_connector_metadata: SimpleCPUOffloadMetadata
     ) -> None:
@@ -333,6 +408,13 @@ class SimpleCPUOffloadWorker:
 
     def _flush_and_sync_all(self) -> None:
         """Synchronize all in-flight transfer events."""
+        # 滞后 store：先把持有批提交出去再同步——抢占后块可能被复用，
+        # 持有批的 DMA 必须在 flush 返回前完成，否则读到复用后的数据。
+        if self._lagged_batches and self._backend is not None:
+            self._submit_lagged(self._backend)
+            # launch_copy 只入队，done 事件要等 store 线程处理到该队列项
+            # 之后才注册；不先过队列屏障，下面的事件同步覆盖不到持有批。
+            self._backend.store_barrier()
         # KVLog profiling：抢占 flush 是 engine 的真实阻塞点
         t0 = profiler.now() if profiler.PROFILE else 0.0
         for event_idx, event in self._load_events:

@@ -1,0 +1,48 @@
+{
+  "timestamp": "2026-08-27T15:53:20.607359",
+  "serving": {
+    "wall_s": 134.61255009658635,
+    "num_requests": 132,
+    "total_output_tokens": 67492,
+    "output_tok_s": 501.37970012137475
+  },
+  "disk_ceiling_gib_s": {
+    "seq_write_gib_s": 0.36354256076951263,
+    "seq_read_gib_s": 5.1651720545261215
+  },
+  "store": {
+    "blocks": 0,
+    "bytes_gib": 0.0,
+    "eff_bw_gib_s": 0.0,
+    "syscalls": 0,
+    "io_wall_s": 0.0,
+    "sync_wall_s": 0.0,
+    "dma_wall_s": 0.0,
+    "batch_wall_s": 0.0
+  },
+  "load": {
+    "blocks": 0,
+    "bytes_gib": 0.0,
+    "eff_bw_gib_s": 0.0,
+    "syscalls": 0,
+    "io_wall_s": 0.0,
+    "sync_wall_s": 0.0,
+    "dma_wall_s": 0.0,
+    "batch_wall_s": 0.0
+  },
+  "restore_latency_s": {
+    "count": 0,
+    "mean": 0.0,
+    "p50": 0.0,
+    "max": 0.0
+  },
+  "pending_restore_peak": 0,
+  "flush": {
+    "count": 0,
+    "wall_s": 0.0
+  },
+  "media_utilization_load_pct": 0.0,
+  "media_utilization_store_pct": 0.0,
+  "syscalls_per_gib_store": 0.0,
+  "syscalls_per_gib_load": 0.0
+}
