@@ -122,8 +122,19 @@ def _resolve_batch_memcpy() -> tuple[Any, int]:
 
     from cuda.bindings import driver as drv
 
-    err, ptr, _ = drv.cuGetProcAddress(b"cuMemcpyBatchAsync", 12080, 0)
-    if err != drv.CUresult.CUDA_SUCCESS:
+    try:
+        err, ptr, _ = drv.cuGetProcAddress(b"cuMemcpyBatchAsync", 12080, 0)
+    except ValueError:
+        # 新驱动返回的 symbolStatus 为位组合值（如 18），旧版 cuda-bindings
+        # 的严格枚举会抛 ValueError；符号本身已解析成功，改用 ctypes 直接
+        # 调 libcuda，忽略 symbolStatus。
+        pfn = ctypes.c_void_p()
+        status = ctypes.c_int()
+        err = ctypes.CDLL("libcuda.so.1").cuGetProcAddress(
+            b"cuMemcpyBatchAsync", ctypes.byref(pfn), 12080,
+            ctypes.c_uint64(0), ctypes.byref(status))
+        ptr = pfn.value
+    if err != drv.CUresult.CUDA_SUCCESS or not ptr:
         raise RuntimeError(f"cuGetProcAddress(cuMemcpyBatchAsync) failed: {err}")
     return _BATCH_MEMCPY_FUNC_TYPE(ptr), 1
 
