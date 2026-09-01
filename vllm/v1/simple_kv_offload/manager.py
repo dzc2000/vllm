@@ -111,6 +111,7 @@ class _DiskSegmentAllocator:
         # 观测计数（段利用率计量用）
         self.num_taken: int = 0
         self.num_segments_recycled: int = 0
+        self.num_segments_evicted: int = 0
 
     def take_block(self) -> "KVCacheBlock | None":
         """段内 bump 取下一个空闲 slot，并完成池记账（出队/逐 hash/引用计数）。
@@ -120,7 +121,7 @@ class _DiskSegmentAllocator:
         pool = self._pool
         while True:
             if self._active < 0:
-                if not self._free_segs:
+                if not self._free_segs and not self._evict_coldest_segment():
                     return None
                 self._active = self._free_segs.popleft()
                 self._seg_free[self._active] = False
@@ -197,18 +198,56 @@ class _DiskSegmentAllocator:
         return None
 
     def _try_recycle(self, seg: int) -> None:
-        """段内全部 slot 空闲（ref_cnt==0 或 null）时归还段空闲列表尾部。"""
+        """整段真空（每块 null，或 ref_cnt==0 且哈希已摘）时归还段空闲列表尾部。
+
+        ref_cnt==0 但 block_hash 仍在的块是有效缓存块；提前回收其所在段
+        等于逐出缓存，同一前缀再次落盘时只能重写（重写放大之源）。
+        """
         if self._seg_free[seg]:
             return
         base = seg * self._seg_size
         end = min(base + self._seg_size, self._num_slots)
         if all(
-            self._blocks[b].is_null or self._blocks[b].ref_cnt == 0
+            self._blocks[b].is_null
+            or (
+                self._blocks[b].ref_cnt == 0
+                and self._blocks[b].block_hash is None
+            )
             for b in range(base, end)
         ):
             self._seg_free[seg] = True
             self._free_segs.append(seg)
             self.num_segments_recycled += 1
+
+    def _evict_coldest_segment(self) -> bool:
+        """段耗尽时，按自由队列驱逐序逐出最冷缓存段并回收。
+
+        从自由队列头（最冷）扫自由块，跳过仍被 pin（ref_cnt!=0）的段；
+        命中含缓存块的段后摘掉段内全部缓存块哈希（数据不动、只删索引），
+        再整段回收。找不到可逐出段（真容量压力）返回 False，调用方按
+        out_of_space 处理。
+        """
+        pool = self._pool
+        for blk in pool.free_block_queue.iter_blocks_after(None):
+            if blk.is_null or blk.block_hash is None:
+                continue
+            seg = blk.block_id // self._seg_size
+            base = seg * self._seg_size
+            end = min(base + self._seg_size, self._num_slots)
+            if any(
+                not self._blocks[b].is_null and self._blocks[b].ref_cnt != 0
+                for b in range(base, end)
+            ):
+                continue
+            for b in range(base, end):
+                cand = self._blocks[b]
+                if not cand.is_null and cand.block_hash is not None:
+                    pool._maybe_evict_cached_block(cand)
+            self._try_recycle(seg)
+            if self._seg_free[seg]:
+                self.num_segments_evicted += 1
+            return self._seg_free[seg]
+        return False
 
     def note_freed(self, block_ids: Iterable[int]) -> None:
         """块归还后检查所属段是否整段空闲，是则归还段空闲列表尾部。"""
@@ -566,6 +605,9 @@ class SimpleCPUOffloadScheduler:
         self._reqs_to_store: dict[str, StoreRequestState] = {}
         self._store_event_to_reqs: dict[int, list[str]] = {}
         self._in_flight_store_gpu_blocks: set[int] = set()
+        # 重写去重：哈希口径在途集。块 id 去重挡不住"GPU 块逐出后同内容落新块"，
+        # 而哈希要到 store 完成才注册进索引，期间同哈希会被重复判写。
+        self._in_flight_store_hashes: dict[bytes, int] = {}
         self._abandoned_reqs_to_load: dict[str, LoadRequestState] = {}
 
         # Event counters
@@ -990,6 +1032,7 @@ class SimpleCPUOffloadScheduler:
             if (
                 bhash is not None
                 and not node.is_null
+                and bhash not in self._in_flight_store_hashes
                 and cpu_pool.cached_block_hash_to_block.get_one_block(bhash) is None
             ):
                 if seg_alloc is not None:
@@ -1012,6 +1055,7 @@ class SimpleCPUOffloadScheduler:
             cpu_ids = [blk.block_id for blk in cpu_blocks]
             for cpu_blk, bhash in zip(cpu_blocks, block_hashes):  # type: ignore[assignment]
                 cpu_blk._block_hash = bhash  # type: ignore[assignment]
+            self._track_in_flight_hashes(block_hashes)
             # Touch GPU blocks to prevent eviction during async copy.
             gpu_pool.touch([gpu_pool.blocks[bid] for bid in gpu_ids])
         else:
@@ -1103,6 +1147,7 @@ class SimpleCPUOffloadScheduler:
                         continue  # 块失效，放弃重试
                     if (
                         bid in in_flight
+                        or blk.block_hash in self._in_flight_store_hashes
                         or cpu_block_pool.cached_block_hash_to_block.get_one_block(
                             blk.block_hash
                         )
@@ -1162,6 +1207,7 @@ class SimpleCPUOffloadScheduler:
                     # Skip if already scheduled for store or already cached in CPU.
                     if (
                         gpu_block_id in in_flight
+                        or bhash_with_group in self._in_flight_store_hashes
                         or cpu_block_pool.cached_block_hash_to_block.get_one_block(
                             bhash_with_group
                         )
@@ -1227,6 +1273,7 @@ class SimpleCPUOffloadScheduler:
                 if profiler.PROFILE:
                     merged_block_hashes.extend(block_hashes_to_store)
                 in_flight.update(gpu_block_ids)
+                self._track_in_flight_hashes(block_hashes_to_store)
 
                 # Touch GPU blocks to prevent freeing during async copy
                 gpu_block_pool.touch(
@@ -1331,6 +1378,7 @@ class SimpleCPUOffloadScheduler:
         for cpu_block in cpu_blocks:
             bhash = cpu_block.block_hash
             assert bhash is not None
+            self._untrack_in_flight_hash(bhash)
             self.cpu_block_pool.cached_block_hash_to_block.insert(bhash, cpu_block)
 
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
@@ -1344,12 +1392,27 @@ class SimpleCPUOffloadScheduler:
         """Release transfer refs without making copied data cacheable."""
         cpu_blocks = [self.cpu_block_pool.blocks[bid] for bid in transfer.cpu_block_ids]
         for cpu_block in cpu_blocks:
+            if cpu_block.block_hash is not None:
+                self._untrack_in_flight_hash(cpu_block.block_hash)
             cpu_block.reset_hash()
         self._free_cpu_blocks(cpu_blocks)
         assert self._gpu_block_pool is not None
         self._gpu_block_pool.free_blocks(
             self._gpu_block_pool.blocks[bid] for bid in transfer.gpu_block_ids
         )
+
+    def _track_in_flight_hashes(self, hashes: Iterable[bytes]) -> None:
+        for h in hashes:
+            self._in_flight_store_hashes[h] = (
+                self._in_flight_store_hashes.get(h, 0) + 1
+            )
+
+    def _untrack_in_flight_hash(self, bhash: bytes) -> None:
+        n = self._in_flight_store_hashes.get(bhash, 0)
+        if n <= 1:
+            self._in_flight_store_hashes.pop(bhash, None)
+        else:
+            self._in_flight_store_hashes[bhash] = n - 1
 
     def has_pending_stores(self) -> bool:
         """Return True if there are in-flight store transfers."""
@@ -1480,6 +1543,7 @@ class SimpleCPUOffloadScheduler:
         self._abandoned_store_event_to_blocks.update(self._store_event_to_blocks)
         self._store_event_to_blocks.clear()
         self._in_flight_store_gpu_blocks.clear()
+        self._in_flight_store_hashes.clear()
 
         # Loads that have not been sent to the worker cannot have running DMA.
         # In-flight loads stay pinned and are cleaned up on completion.
