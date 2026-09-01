@@ -119,6 +119,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # 节拍税（§4.6）。0 = 原生行为（A/B 基线）；1 = 纯滞后一步；
         # >=2 = 跨步攒批（多步批合并提交，摊薄交错碎片）。
         lag_store_steps = int(extra_config.get("lag_store_steps", 0))
+        # KVLog WriteGate v1：写准入信号集（逗号分隔：share,lifecycle；
+        # 空 = 关闭，原生全写基线）。经 extra_config 传递（环境变量在
+        # EngineCore 子进程中不可靠）。
+        write_gate_signals = str(extra_config.get("write_gate_signals", ""))
 
         # KVLog profiling：环境变量在 EngineCore 子进程中不可靠，
         # 经 extra_config（随 VllmConfig 序列化传递）激活是可靠路径。
@@ -163,7 +167,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         logger.info(
             "SimpleCPUOffloadConnector: role=%s, "
             "per_rank=%.2f GB, world_size=%d, mode=%s, backend=%s, disk=%s, "
-            "lag_store_steps=%d",
+            "lag_store_steps=%d, write_gate=%r",
             role.name,
             cpu_capacity_per_rank / (1024**3),
             world_size,
@@ -171,6 +175,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             kv_offload_backend,
             disk_path or "none",
             lag_store_steps,
+            write_gate_signals,
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -188,6 +193,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 hash_block_size=hash_block_size,
                 lazy_offload=lazy_offload,
                 disk_capacity_bytes=disk_capacity_bytes if disk_mode else 0,
+                write_gate_signals=write_gate_signals,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
@@ -205,6 +211,20 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             )
 
     # --- Worker-side methods ---
+
+    def shutdown(self):
+        # 引擎 teardown（scheduler.shutdown -> connector.shutdown）只作用于
+        # scheduler 角色实例；本版本框架不调 worker 角色的 shutdown，而
+        # store 线程（daemon）在 worker 侧。两角色同进程，经模块级注册表
+        # 触发 worker 排干：提交滞后尾批 + 排空 store 队列，使 profiler
+        # 的 store 计数在进程退出前闭合（体积账决策数 = 落盘数）。
+        # 幂等：backend.shutdown 以 _shutdown 标志去重。
+        from vllm.v1.simple_kv_offload.worker import shutdown_active_worker
+
+        if self.worker_handler is not None:
+            self.worker_handler.shutdown()
+        else:
+            shutdown_active_worker()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self.worker_handler is not None:

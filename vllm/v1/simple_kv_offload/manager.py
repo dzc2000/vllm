@@ -3,7 +3,6 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
-import os
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
@@ -26,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.simple_kv_offload import profiler
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
@@ -63,6 +63,11 @@ class StoreRequestState:
     # Per-group cursors tracking how many blocks have been stored/skipped.
     num_stored_blocks: list[int]
     store_events: set[int] = field(default_factory=set)
+    # WriteGate v2：被暂缓的块 (group_idx, gpu_block_id) 重试队列。
+    # 游标照常推进（语义=已决策过）；每步扫描前先重试 pending，
+    # ref_cnt 被兄弟请求顶上去后翻盘写盘。请求被抢占时块 id 失效，
+    # 队列随 block_ids 一起清空。
+    gate_pending: list[tuple[int, int]] = field(default_factory=list)
     finished: bool = False
 
 
@@ -218,6 +223,7 @@ class SimpleCPUOffloadScheduler:
         hash_block_size: int,
         lazy_offload: bool = False,
         disk_capacity_bytes: int = 0,
+        write_gate_signals: str = "",
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -266,6 +272,27 @@ class SimpleCPUOffloadScheduler:
             "disk" if disk_capacity_bytes > 0 else "cpu",
         )
 
+        # WriteGate v1：写准入信号集（空 = 关闭，原生全写基线）。
+        # share 走 BlockPool.ref_cnt（请求分配/前缀命中各 +1，radix 注册
+        # 不持引用），故 ref_cnt>1 = 前缀主干被多请求共享，ref_cnt==1
+        # = 单请求私有尾缀。lifecycle = 被抢占请求无条件写（恢复省重算）。
+        self._write_gate_signals: set[str] = {
+            s.strip() for s in write_gate_signals.split(",") if s.strip()
+        }
+        # WriteGate v2：首丢 hash 集合（体积账去重键；hash 内容寻址稳定）
+        self._gate_dropped_hashes: set[bytes] = set()
+        if self._write_gate_signals:
+            logger.info(
+                "SimpleCPUOffloadScheduler: WriteGate signals=%s "
+                "(eager store path only)",
+                sorted(self._write_gate_signals),
+            )
+            if lazy_offload:
+                logger.warning(
+                    "WriteGate signals are only applied on the eager store "
+                    "path; lazy mode keeps native all-write behavior."
+                )
+
         spec_config = vllm_config.speculative_config
         use_eagle = spec_config is not None and spec_config.use_eagle()
         self.cpu_coordinator: KVCacheCoordinator = get_kv_cache_coordinator(
@@ -287,9 +314,7 @@ class SimpleCPUOffloadScheduler:
         # KVLog M3 阶段一：磁盘模式下用段式分配器保证 disk slot 物理连续
         # （run 合并 I/O 的前提）。CPU 模式保持原生 free-queue 分配。
         self._disk_seg_alloc: _DiskSegmentAllocator | None = None
-        if disk_capacity_bytes > 0 and os.environ.get(
-            "KVLOG_DISK_SEG_ALLOC", "1"
-        ) != "0":
+        if disk_capacity_bytes > 0:
             self._disk_seg_alloc = _DiskSegmentAllocator(
                 self.cpu_block_pool, self.num_cpu_blocks, segment_size=32
             )
@@ -521,6 +546,7 @@ class SimpleCPUOffloadScheduler:
         gpu_block_ids: list[int] = []
         cpu_block_ids: list[int] = []
         cpu_blocks_to_touch: list[KVCacheBlock] = []
+        load_hit_hashes: list[bytes] = []
 
         for g in range(num_groups):
             cpu_blocks_g = cpu_hit_blocks[g]
@@ -545,6 +571,12 @@ class SimpleCPUOffloadScheduler:
                 gpu_block_ids.append(group_gpu_ids[gpu_ext_start + i])
                 cpu_block_ids.append(cpu_blk.block_id)
                 cpu_blocks_to_touch.append(cpu_blk)
+                if profiler.PROFILE and cpu_blk.block_hash is not None:
+                    load_hit_hashes.append(cpu_blk.block_hash)
+
+        if profiler.PROFILE and load_hit_hashes:
+            # 体积账：读回侧每块命中次数 +1，与写侧对账死写。
+            profiler.note_block_loads(load_hit_hashes)
 
         # Touch CPU blocks to prevent eviction during async load.
         self.cpu_block_pool.touch(cpu_blocks_to_touch)
@@ -615,6 +647,35 @@ class SimpleCPUOffloadScheduler:
             need_flush=bool(scheduler_output.preempted_req_ids),
         )
         return result
+
+    def _write_gate_should_store(
+        self, gpu_block: "KVCacheBlock", preempted: bool
+    ) -> bool:
+        """WriteGate v2：逐块写准入。返回 False = 暂缓（不写盘，下步重扫）。
+
+        暂缓永远安全：块未 offload 与被 gate 拒绝在未来未命中时的代价
+        一致（重算），不会造成正确性问题。
+
+        v1 教训：决策发生在块刚算完的时刻，此刻它只被当前请求持有
+        （ref_cnt==1），而未来会被复用的前缀此刻恰恰是 ref_cnt==1——
+        "当下共享"与"未来复用"负相关，一次定终身的丢弃把热点全丢了。
+        v2 修法：拒绝不推进游标，后续步重扫；兄弟请求 lookup 命中后
+        ref_cnt>1 即翻盘写盘。
+
+        - share：前缀共享度。ref_cnt>1（≥2 个请求同持 = 前缀主干）才写；
+          ref_cnt==1（单请求私有尾缀）暂缓。依据：本池 ref_cnt 只由
+          请求分配与前缀命中递增，radix 注册哈希不持引用（block_pool
+          ._insert_block_hash），故该判据即"当下是否被共享"。
+        - lifecycle：被抢占请求的块无条件写（恢复时省重算）。
+        """
+        signals = self._write_gate_signals
+        if not signals:
+            return True
+        if "lifecycle" in signals and preempted:
+            return True
+        if "share" in signals:
+            return gpu_block.ref_cnt > 1
+        return True
 
     def prepare_store_specs(
         self, scheduler_output: SchedulerOutput
@@ -689,6 +750,10 @@ class SimpleCPUOffloadScheduler:
         else:
             cpu_ids = []
 
+        if profiler.PROFILE:
+            # 体积账：写侧逐块决策。WriteGate 接入前 dropped 恒为 0。
+            profiler.note_store_decision(len(gpu_ids), 0, block_hashes)
+
         return gpu_ids, cpu_ids, []
 
     def _prepare_eager_store_specs(
@@ -707,6 +772,8 @@ class SimpleCPUOffloadScheduler:
 
         merged_gpu_block_ids: list[int] = []
         merged_cpu_block_ids: list[int] = []
+        merged_block_hashes: list[bytes] = []
+        merged_dropped_blocks = 0
         req_ids: list[str] = []
 
         gpu_block_pool = self._gpu_block_pool
@@ -729,6 +796,8 @@ class SimpleCPUOffloadScheduler:
             if preempted:
                 state.block_ids = tuple([] for _ in range(num_groups))
                 state.num_stored_blocks = [0] * num_groups
+                # 旧块 id 随抢占失效，重试队列一并清空
+                state.gate_pending.clear()
             if new_block_id_groups:
                 for g in range(min(num_groups, len(new_block_id_groups))):
                     if new_block_id_groups[g] is not None:
@@ -745,6 +814,7 @@ class SimpleCPUOffloadScheduler:
             # --- Phase 1: Scan blocks, classify as cached vs to-store ---
             gpu_block_ids: list[int] = []
             block_hashes_to_store: list[bytes] = []
+            n_dropped_req = 0
             # 段式分配时逐块在此获取 CPU/磁盘块（bump 连续）；否则扫描后批量分配
             cpu_blocks_alloc: list[KVCacheBlock] = []
             advanced_per_group: list[int] = [0] * num_groups
@@ -754,6 +824,42 @@ class SimpleCPUOffloadScheduler:
             confirmed_tokens = req.num_computed_tokens - req.num_output_placeholders
             # Cap to blocks with confirmed KV data.
             aligned_tokens = confirmed_tokens // self.block_size * self.block_size
+
+            # --- Phase 0: WriteGate v2 重试暂缓块（先于新块扫描） ---
+            if state.gate_pending:
+                still_pending: list[tuple[int, int]] = []
+                for g, bid in state.gate_pending:
+                    blk = gpu_block_pool.blocks[bid]
+                    if blk.is_null or blk.block_hash is None:
+                        continue  # 块失效，放弃重试
+                    if (
+                        bid in in_flight
+                        or cpu_block_pool.cached_block_hash_to_block.get_one_block(
+                            blk.block_hash
+                        )
+                        is not None
+                    ):
+                        continue  # 已在写或 CPU 池已有同 hash
+                    if self._write_gate_should_store(blk, preempted):
+                        if seg_alloc is not None:
+                            aff_key = f"g{bid // 32}"
+                            cpu_blk = seg_alloc.take_block_affinity(aff_key)
+                            if cpu_blk is None:
+                                out_of_space = True
+                                still_pending.append((g, bid))
+                                continue
+                            cpu_blocks_alloc.append(cpu_blk)
+                        else:
+                            if num_free <= 0:
+                                out_of_space = True
+                                still_pending.append((g, bid))
+                                continue
+                            num_free -= 1
+                        gpu_block_ids.append(bid)
+                        block_hashes_to_store.append(blk.block_hash)
+                    else:
+                        still_pending.append((g, bid))
+                state.gate_pending = still_pending
 
             for g in range(num_groups):
                 # FIXME (yifan): handle CPU cache eviction, where
@@ -792,6 +898,18 @@ class SimpleCPUOffloadScheduler:
                         advanced_per_group[g] += 1
                         continue
 
+                    # WriteGate v2：逐块写准入。拒绝 = 暂缓入 per-request
+                    # 重试队列（游标照常推进）；每步扫描前重试 pending，
+                    # 兄弟请求 lookup 命中把 ref_cnt 顶上去后翻盘写盘。
+                    # 体积账按 hash 首丢去重（块 id 会被复用，不可作键）。
+                    if not self._write_gate_should_store(gpu_block, preempted):
+                        advanced_per_group[g] += 1
+                        state.gate_pending.append((g, gpu_block_id))
+                        if bhash_with_group not in self._gate_dropped_hashes:
+                            self._gate_dropped_hashes.add(bhash_with_group)
+                            n_dropped_req += 1
+                        continue
+
                     if seg_alloc is not None:
                         # 阶段二段亲和：同请求块聚同段（GPU 块 id 邻近为 key）
                         aff_key = f"g{gpu_block_id // 32}"
@@ -828,6 +946,8 @@ class SimpleCPUOffloadScheduler:
                 req_ids.append(req_id)
                 merged_gpu_block_ids.extend(gpu_block_ids)
                 merged_cpu_block_ids.extend(cpu_block_ids)
+                if profiler.PROFILE:
+                    merged_block_hashes.extend(block_hashes_to_store)
                 in_flight.update(gpu_block_ids)
 
                 # Touch GPU blocks to prevent freeing during async copy
@@ -845,6 +965,14 @@ class SimpleCPUOffloadScheduler:
             # Advance per-group cursors (includes cached hits + newly stored)
             for g in range(num_groups):
                 state.num_stored_blocks[g] += advanced_per_group[g]
+            merged_dropped_blocks += n_dropped_req
+
+        if profiler.PROFILE and (merged_gpu_block_ids or merged_dropped_blocks):
+            # 体积账：写侧逐块决策（写盘 / WriteGate 拒绝）。
+            profiler.note_store_decision(
+                len(merged_gpu_block_ids), merged_dropped_blocks,
+                merged_block_hashes,
+            )
 
         return merged_gpu_block_ids, merged_cpu_block_ids, req_ids
 

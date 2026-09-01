@@ -78,21 +78,59 @@ def _bucket(length: int) -> int:
 
 # worker 侧时间序列（截断保护，避免长跑撑爆内存）
 _MAX_SERIES = 200_000
-_dep_wait = {"store": 0.0, "load": 0.0}
-
-def note_dep_wait(direction: str, seconds: float) -> None:
-    """等待上游依赖事件（如 compute_done）的主机侧耗时。"""
-    if PROFILE:
-        with _lock:
-            _dep_wait[direction] += seconds
-
 _load_events: list[list[float]] = []  # [submit_ts, done_ts]
 _pending_series: list[list[float]] = []  # [ts, pending_load_events]
 _flush_stats = {"count": 0, "wall_s": 0.0}
 
+# 等待上游依赖事件（如 compute_done）的主机侧墙钟累计：把 sync_wall 拆成
+# 依赖等待（调度节拍税）与 DMA 本体等待，供论文 store 侧分解引用。
+_dep_wait: dict[str, float] = {"store": 0.0, "load": 0.0}
+
+# 体积账（W:R 写放大与死写率的原始计数）：
+# stored_blocks / dropped_blocks：写侧逐块决策计数（WriteGate 接入前
+# dropped 恒为 0，接入后即闸门拒绝数）。
+# _block_hits：块内容哈希 -> 该块被写盘后读回（load）的次数。
+# 键域 <= 盘池容量（每哈希最多一条），长跑安全；读回侧聚合为直方图输出。
+_volume = {"stored_blocks": 0, "dropped_blocks": 0}
+_block_hits: dict[bytes, int] = {}
+
 
 def now() -> float:
     return time.perf_counter()
+
+
+def note_dep_wait(direction: str, seconds: float) -> None:
+    """等待上游依赖事件（如 compute_done）的主机侧耗时。"""
+    if not PROFILE:
+        return
+    with _lock:
+        _dep_wait[direction] += seconds
+
+
+def note_store_decision(n_stored: int, n_dropped: int,
+                        stored_hashes: list[bytes] | None = None) -> None:
+    """写侧逐块决策记账：写盘 / 丢弃（WriteGate 拒绝）块数。
+
+    stored_hashes 为实际写盘块的内容哈希，用于与读回侧对账
+    （哪块写出去之后从未被读回 = 死写）。
+    """
+    if not PROFILE:
+        return
+    with _lock:
+        _volume["stored_blocks"] += n_stored
+        _volume["dropped_blocks"] += n_dropped
+        if stored_hashes:
+            for h in stored_hashes:
+                _block_hits.setdefault(h, 0)
+
+
+def note_block_loads(hashes: list[bytes]) -> None:
+    """读回侧记账：每块内容哈希的命中（load）次数 +1。"""
+    if not PROFILE:
+        return
+    with _lock:
+        for h in hashes:
+            _block_hits[h] = _block_hits.get(h, 0) + 1
 
 
 def note_batch(direction: str, blocks: int, wall: float,
@@ -198,6 +236,24 @@ def activate(out_path: str | None = None) -> None:
     _activated_pid = pid
 
 
+def _volume_summary() -> dict:
+    # 块级哈希表不出原始哈希（不可 JSON 化且体积大），聚合为：
+    # 命中次数直方图（0 次 = 死写）+ 死写块数 + W:R 所需计数。
+    hits_hist: dict[int, int] = {}
+    dead = 0
+    for n in _block_hits.values():
+        hits_hist[n] = hits_hist.get(n, 0) + 1
+        if n == 0:
+            dead += 1
+    return {
+        "stored_blocks": _volume["stored_blocks"],
+        "dropped_blocks": _volume["dropped_blocks"],
+        "tracked_blocks": len(_block_hits),
+        "dead_blocks": dead,
+        "hits_hist": {str(k): v for k, v in sorted(hits_hist.items())},
+    }
+
+
 def _dump() -> None:
     try:
         with _lock:
@@ -206,6 +262,7 @@ def _dump() -> None:
                     "pid": os.getpid(),
                     "dump_ts": time.time(),
                     "io": {k: dict(v) for k, v in _io_stats.items()},
+                    "volume": _volume_summary(),
                     "runs": {
                         k: {
                             "runs_hist": dict(v["runs_hist"]),
@@ -224,6 +281,8 @@ def _dump() -> None:
                 },
             }
         os.makedirs(os.path.dirname(OUT_PATH) or ".", exist_ok=True)
+        # 每个写者独立 tmp：dumper 线程与 atexit 并发 _dump 时共用同一
+        # tmp 会交错写入产生损坏 JSON（读方 json.loads 失败被跳过）。
         tmp = OUT_PATH + f".tmp.{threading.get_ident()}"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(payload, f)

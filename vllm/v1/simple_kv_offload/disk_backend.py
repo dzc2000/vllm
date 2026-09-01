@@ -309,6 +309,12 @@ class DiskBackend:
         if self._shutdown:
             return
         self._shutdown = True
+        # 先排干 store 队列再发终止哨：滞后 store 的尾巴在引擎退出时仍
+        # 在队列/线程中，直接杀 daemon 线程会截断 store 计数（体积账
+        # 决策数与落盘数对不上）。屏障项排在既有批之后，被 set 时所有
+        # 先入队批的 note_batch 已执行，计数闭合。超时兜底线程已死
+        # （异常退出）的情况，此时尾巴本就保不住，只损失等待时间。
+        self.store_barrier(timeout=120.0)
         self._store_queue.put(None)
         self._load_queue.put(None)
         if self._store_thread is not None:

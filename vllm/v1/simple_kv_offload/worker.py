@@ -23,6 +23,19 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# teardown 排干注册表：本版本 vLLM 只调 scheduler 侧 connector.shutdown()
+# （scheduler.shutdown -> connector.shutdown），worker 侧 backend 的 store
+# 线程（daemon）无人收尾、退出时被直接杀——滞后 store 尾巴被截断，体积账
+# 决策数与落盘数对不上。两角色连接器同在 EngineCore 进程，经模块级引用
+# 让任一角色的 shutdown 都能触发 worker 侧排干。每进程单 worker。
+_active_worker: "SimpleCPUOffloadWorker | None" = None
+
+
+def shutdown_active_worker() -> None:
+    """排干当前进程的 worker（幂等；无 worker / 已排干时为空操作）。"""
+    if _active_worker is not None:
+        _active_worker.shutdown()
+
 
 class SimpleCPUOffloadWorker:
     """Worker-side handler for CPU offloading transfers."""
@@ -97,6 +110,25 @@ class SimpleCPUOffloadWorker:
         # KVLog profiling（KVLOG_PROFILE=0 时不使用）：load 提交时间戳，
         # event_idx -> submit perf_counter
         self._load_submit_ts: dict[int, float] = {}
+
+        # teardown 排干注册（见模块头注释；backend.shutdown 幂等可重入）
+        global _active_worker
+        _active_worker = self
+
+    def shutdown(self) -> None:
+        """引擎 teardown：提交滞后尾批并排干 store 队列，使计数闭合。
+
+        滞后 store 的最后一批由 worker 扣住（keep=1），run 结束后没有
+        下一步触发提交；不在此交出，该批既不落盘也不计数，体积账的
+        决策数与落盘数出现系统性缺口。backend.shutdown 内部先过队列
+        屏障再发终止哨，保证所有已入队批完成（含 note_batch）。
+        """
+        backend = self._backend
+        if backend is None:
+            return
+        if self._lagged_batches:
+            self._submit_lagged(backend)
+        backend.shutdown()
 
     def register_kv_caches(
         self,
