@@ -94,6 +94,10 @@ _dep_wait: dict[str, float] = {"store": 0.0, "load": 0.0}
 _volume = {"stored_blocks": 0, "dropped_blocks": 0}
 _block_hits: dict[bytes, int] = {}
 
+# WriteGate v3 闭环回路：控制器把在线死写率与档位轨迹写回这里，随分片
+# 一起落盘（gate 决策发生在 EngineCore 进程，与 _block_hits 同进程同账本）。
+_gate: dict = {}
+
 
 def now() -> float:
     return time.perf_counter()
@@ -131,6 +135,37 @@ def note_block_loads(hashes: list[bytes]) -> None:
     with _lock:
         for h in hashes:
             _block_hits[h] = _block_hits.get(h, 0) + 1
+
+
+def hit_counts(hashes: list[bytes]) -> list[int]:
+    """批量查读回账本：每个哈希被 load 的次数（无记录 = 0）。
+
+    单次取锁，供 WriteGate 在逐块扫描中按祖先链批量判定"该前缀家族
+    历史上是否被复用"（账本判据 = 命中次数 > 0，与体积账同源）。
+    注意：PROFILE 关闭时账本不记录，返回值恒为全 0，调用方不可把
+    "无数据"当"无命中"（gate 侧已做显式校验）。
+    """
+    if not PROFILE or not hashes:
+        return [0] * len(hashes)
+    with _lock:
+        return [_block_hits.get(h, 0) for h in hashes]
+
+
+def was_ever_hit(h: bytes) -> bool:
+    """块写盘后是否至少被读回过一次（False = 尚无命中记录/未记账）。"""
+    if not PROFILE:
+        return False
+    with _lock:
+        return _block_hits.get(h, 0) > 0
+
+
+def note_gate_state(state: dict) -> None:
+    """WriteGate 闭环控制器快照（覆盖写，随分片 dump）。"""
+    if not PROFILE:
+        return
+    with _lock:
+        _gate.clear()
+        _gate.update(state)
 
 
 def note_batch(direction: str, blocks: int, wall: float,
@@ -263,6 +298,7 @@ def _dump() -> None:
                     "dump_ts": time.time(),
                     "io": {k: dict(v) for k, v in _io_stats.items()},
                     "volume": _volume_summary(),
+                    "gate": dict(_gate),
                     "runs": {
                         k: {
                             "runs_hist": dict(v["runs_hist"]),

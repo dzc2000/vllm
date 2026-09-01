@@ -63,11 +63,18 @@ class StoreRequestState:
     # Per-group cursors tracking how many blocks have been stored/skipped.
     num_stored_blocks: list[int]
     store_events: set[int] = field(default_factory=set)
-    # WriteGate v2：被暂缓的块 (group_idx, gpu_block_id) 重试队列。
+    # WriteGate v2：被暂缓的块 (group_idx, gpu_block_id, position) 重试队列。
     # 游标照常推进（语义=已决策过）；每步扫描前先重试 pending，
     # ref_cnt 被兄弟请求顶上去后翻盘写盘。请求被抢占时块 id 失效，
-    # 队列随 block_ids 一起清空。
-    gate_pending: list[tuple[int, int]] = field(default_factory=list)
+    # 队列随 block_ids 一起清空。position 是该块在本请求 block_ids[g] 中的
+    # 下标，供 v3 的 ledger 判据回溯祖先链。
+    gate_pending: list[tuple[int, int, int]] = field(default_factory=list)
+    # WriteGate v3 ledger：前缀家族复用前沿（见 _gate_family_hit）。
+    # ledger_front[g] = 已确认"自身与祖先都未被读回过"的前缀长度；
+    # ledger_hit_at[g] = 第一个"曾被读回"的块下标（-1 = 未发现）。
+    # 命中是单调事实，故前沿只前进不后退，判据摊还 O(1)。
+    ledger_front: list[int] = field(default_factory=list)
+    ledger_hit_at: list[int] = field(default_factory=list)
     finished: bool = False
 
 
@@ -211,6 +218,178 @@ class _DiskSegmentAllocator:
             self._try_recycle(seg)
 
 
+# --- WriteGate v3：闭环反馈回路（在线死写率 -> 准入激进度）----------------
+
+GATE_RELAX = "relax"
+GATE_MID = "mid"
+GATE_STRICT = "strict"
+
+
+class WriteGateController:
+    """按在线死写率调节写准入激进度的反馈控制器（提案 §5.3 待接项）。
+
+    信号源与论文体积账**同一套计数**（profiler 的写侧账本 + 读回命中表）：
+    写出去的块在一个成熟窗（horizon，按后续写盘块数计——约 1/3 池周转的
+    量级）内始终没被读回过，即结算为一次死写。控制器在结算结果的滑动窗上
+    算死写率，带迟滞地在三档间迁移，一次只走一档：
+
+    - ``relax``   ：全写（等价 gate 关闭）。冷启动档位——没有浪费证据之前
+                    不丢任何一次写，避免误杀首屏复用。
+    - ``mid``     ：share ∨ ledger。当下被多请求共享，或该前缀家族历史上
+                    被读回过，才写。
+    - ``strict``  ：ledger ∨ lifecycle。share 在冷回放下与未来复用负相关
+                    （v1 实测 100% 死写），证据不足时只信历史复用记录。
+
+    迟滞带：升档 0.50 / 0.90，降档 0.45 / 0.75，且需攒够 ``eval_every``
+    个成熟样本才允许改档，避免阈值附近抖动让写量来回摆。lifecycle 保底
+    （被抢占请求的块无条件写）不经过控制器，任何档位都保留。
+
+    观测窗冻结保护：拒写太彻底就没有新块可结算、也就没有新证据。若连续
+    ``freeze_steps`` 步在拒写但成熟数为 0，则主动降一档重新探索，保证回路
+    不会单向棘死在 strict。只放开 **strict -> mid** 这一条冻结通道：mid 冻
+    结意味着"连当下共享都没有"，再退到 relax 等于无条件全写，只会把刚省掉
+    的死写重新堆回来；回到 relax 必须由证据（低死写率）驱动。
+    """
+
+    # 升/降档阈值（中间是迟滞带）
+    UP_TO_MID = 0.50
+    UP_TO_STRICT = 0.90
+    DOWN_TO_MID = 0.75
+    DOWN_TO_RELAX = 0.45
+
+    def __init__(
+        self,
+        horizon_blocks: int = 4096,
+        window_blocks: int = 2048,
+        eval_every_blocks: int = 2048,
+        freeze_steps: int = 200,
+    ) -> None:
+        self.horizon = horizon_blocks
+        self.eval_every = eval_every_blocks
+        self.freeze_steps = freeze_steps
+        # 待成熟队列：(提交序号, 块哈希)
+        self._ring: deque[tuple[int, bytes]] = deque()
+        # 成熟结算结果：1 = 死写（越过 horizon 仍无命中），0 = 活
+        self._verdicts: deque[int] = deque(maxlen=window_blocks)
+        self._seq = 0
+        self._due = 0
+        self._frozen = 0
+        self.tier = GATE_RELAX
+        self.dead_rate = 0.0
+        self.matured_total = 0
+        self.dead_total = 0
+        self.transitions = 0
+        self.frozen_downgrades = 0
+        self._seen_drops = 0
+        self._tiers_seen: set[str] = {GATE_RELAX}
+        self._trajectory: list[dict] = []
+        self._max_trajectory = 64
+
+    # --- 回路入口：每次写准入扫描后调用一次 ---------------------------------
+
+    def note_step(self, stored_hashes: list[bytes], n_dropped: int) -> None:
+        """喂入本步写盘块与本步拒写块数，推进成熟窗并（按节流）调档。"""
+        for h in stored_hashes:
+            self._ring.append((self._seq, h))
+            self._seq += 1
+        self._seen_drops += n_dropped
+
+        cutoff = self._seq - self.horizon
+        matured = 0
+        while self._ring and self._ring[0][0] < cutoff:
+            _, h = self._ring.popleft()
+            dead = 0 if profiler.was_ever_hit(h) else 1
+            self._verdicts.append(dead)
+            self.matured_total += 1
+            self.dead_total += dead
+            self._due += 1
+            matured += 1
+
+        if matured or self._seen_drops == 0 or self.tier == GATE_RELAX:
+            self._frozen = 0
+        else:
+            self._frozen += 1
+
+        if self._due >= self.eval_every:
+            self._due = 0
+            self._rebalance()
+        elif self._frozen >= self.freeze_steps:
+            self._frozen = 0
+            self._downgrade_frozen()
+
+    # --- 档位迁移 -----------------------------------------------------------
+
+    def _rebalance(self) -> None:
+        if len(self._verdicts) < self.eval_every:
+            return  # 样本不足，保持当前档
+        rate = sum(self._verdicts) / len(self._verdicts)
+        self.dead_rate = rate
+        if self.tier == GATE_RELAX:
+            if rate >= self.UP_TO_MID:
+                self._move(GATE_MID, rate, "dead_rate")
+        elif self.tier == GATE_MID:
+            if rate >= self.UP_TO_STRICT:
+                self._move(GATE_STRICT, rate, "dead_rate")
+            elif rate <= self.DOWN_TO_RELAX:
+                self._move(GATE_RELAX, rate, "dead_rate")
+        elif rate <= self.DOWN_TO_MID:
+            self._move(GATE_MID, rate, "dead_rate")
+
+    def _downgrade_frozen(self) -> None:
+        """成熟窗冻结（持续拒写、无新证据）时主动降一档探索。
+
+        仅 strict -> mid：mid 已含 share 信号，再冻结说明当下无任何共享可
+        依，退到 relax 只是无条件全写，会把省掉的死写重新堆回来。
+        """
+        if self.tier == GATE_STRICT:
+            self.frozen_downgrades += 1
+            self._move(GATE_MID, self.dead_rate, "window_frozen")
+
+    def _move(self, tier: str, rate: float, reason: str) -> None:
+        prev = self.tier
+        self.tier = tier
+        self.transitions += 1
+        self._tiers_seen.add(tier)
+        if len(self._trajectory) < self._max_trajectory:
+            self._trajectory.append(
+                {
+                    "at_stored": self._seq,
+                    "dead_rate": round(rate, 4),
+                    "tier": tier,
+                    "reason": reason,
+                }
+            )
+        logger.info(
+            "WriteGate auto: %s -> %s (在线死写率 %.3f, 成熟窗 %d 块, "
+            "已写 %d 块, %s)",
+            prev,
+            tier,
+            rate,
+            len(self._verdicts),
+            self._seq,
+            reason,
+        )
+
+    # --- 可观测性 -----------------------------------------------------------
+
+    def snapshot(self) -> dict:
+        return {
+            "tier": self.tier,
+            "tiers_seen": sorted(self._tiers_seen),
+            "transitions": self.transitions,
+            "frozen_downgrades": self.frozen_downgrades,
+            "dead_rate_online": round(self.dead_rate, 4),
+            "window_size": len(self._verdicts),
+            "matured_blocks": self.matured_total,
+            "dead_blocks_matured": self.dead_total,
+            "stored_seen": self._seq,
+            "dropped_seen": self._seen_drops,
+            "horizon_blocks": self.horizon,
+            "eval_every_blocks": self.eval_every,
+            "trajectory": list(self._trajectory),
+        }
+
+
 class SimpleCPUOffloadScheduler:
     """Scheduler-side manager for CPU offloading."""
 
@@ -281,11 +460,44 @@ class SimpleCPUOffloadScheduler:
         }
         # WriteGate v2：首丢 hash 集合（体积账去重键；hash 内容寻址稳定）
         self._gate_dropped_hashes: set[bytes] = set()
+        # WriteGate v3：ledger（历史复用账本）与 auto（闭环控制器）都以
+        # profiler 的读回命中表为唯一数据源。profiler 未开时该表恒空，
+        # "无数据"会被误判成"无命中"而把写全部拒掉，故此处显式降级并告警。
+        self._gate_ledger = bool(self._write_gate_signals & {"ledger", "auto"})
+        self._gate_ctrl: WriteGateController | None = None
+        if self._gate_ledger and not profiler.PROFILE:
+            logger.warning(
+                "WriteGate signals %s 依赖 kvlog_profile 在线账本，但 profiler "
+                "未激活 -> 丢弃 ledger/auto 信号，退化为 %s",
+                sorted(self._write_gate_signals),
+                sorted(self._write_gate_signals - {"ledger", "auto"}) or "关闭",
+            )
+            self._write_gate_signals -= {"ledger", "auto"}
+            self._gate_ledger = False
+        if "auto" in self._write_gate_signals:
+            self._gate_ctrl = WriteGateController()
         if self._write_gate_signals:
             logger.info(
                 "SimpleCPUOffloadScheduler: WriteGate signals=%s "
-                "(eager store path only)",
+                "(eager store path only)%s",
                 sorted(self._write_gate_signals),
+                (
+                    ""
+                    if self._gate_ctrl is None
+                    else (
+                        " auto[closed-loop] start=%s horizon=%d eval_every=%d "
+                        "up=%.2f/%.2f down=%.2f/%.2f"
+                        % (
+                            self._gate_ctrl.tier,
+                            self._gate_ctrl.horizon,
+                            self._gate_ctrl.eval_every,
+                            self._gate_ctrl.UP_TO_MID,
+                            self._gate_ctrl.UP_TO_STRICT,
+                            self._gate_ctrl.DOWN_TO_RELAX,
+                            self._gate_ctrl.DOWN_TO_MID,
+                        )
+                    )
+                ),
             )
             if lazy_offload:
                 logger.warning(
@@ -482,6 +694,8 @@ class SimpleCPUOffloadScheduler:
                 request=request,
                 block_ids=tuple([] for _ in range(num_groups)),
                 num_stored_blocks=[0] * num_groups,
+                ledger_front=[0] * num_groups,
+                ledger_hit_at=[-1] * num_groups,
             )
 
         # Pop the CPU hit cached by get_num_new_matched_tokens(). The
@@ -648,10 +862,47 @@ class SimpleCPUOffloadScheduler:
         )
         return result
 
+    def _gate_family_hit(self, state: StoreRequestState, g: int, pos: int) -> bool:
+        """ledger 判据：该块自身或其**祖先**是否曾被 offload 读回过。
+
+        直觉：一个前缀家族历史上被复用，说明这类 prompt 是"活的"，其后缀
+        写盘大概率不会白写（多轮对话、共享 system prompt 的负载结构）。
+        与 v1 的 share 区别在于这是**历史证据**而非决策时点的瞬时观测。
+
+        命中是单调事实（profiler 只 +1 不清零），"某个祖先被命中"对 pos
+        也是单调的——一旦前沿右侧出现命中，其右侧所有块都判 True。因此用
+        per-(req, group) 的前沿游标只做单向扫描，摊还 O(1)。
+        已知局限：块 id 复用（GPU 池驱逐后重分配）会让缓存的前沿判定过期，
+        故请求被抢占时前沿随 block_ids 一起重置；运行中请求的前缀块被
+        ref 持有，不会被复用。
+        """
+        front = state.ledger_front[g]
+        hit_at = state.ledger_hit_at[g]
+        if hit_at >= 0 and hit_at <= pos:
+            return True
+        pool = self._gpu_block_pool
+        if pool is None:
+            return False
+        ids = state.block_ids[g]
+        blocks = pool.blocks
+        while front <= pos and front < len(ids):
+            blk = blocks[ids[front]]
+            bhash = blk.block_hash
+            if bhash is not None and profiler.was_ever_hit(bhash):
+                state.ledger_hit_at[g] = front
+                state.ledger_front[g] = front + 1
+                return True
+            front += 1
+        state.ledger_front[g] = front
+        return False
+
     def _write_gate_should_store(
-        self, gpu_block: "KVCacheBlock", preempted: bool
+        self,
+        gpu_block: "KVCacheBlock",
+        preempted: bool,
+        ledger_hit: bool = False,
     ) -> bool:
-        """WriteGate v2：逐块写准入。返回 False = 暂缓（不写盘，下步重扫）。
+        """WriteGate v3：逐块写准入。返回 False = 暂缓（不写盘，下步重扫）。
 
         暂缓永远安全：块未 offload 与被 gate 拒绝在未来未命中时的代价
         一致（重算），不会造成正确性问题。
@@ -661,20 +912,36 @@ class SimpleCPUOffloadScheduler:
         "当下共享"与"未来复用"负相关，一次定终身的丢弃把热点全丢了。
         v2 修法：拒绝不推进游标，后续步重扫；兄弟请求 lookup 命中后
         ref_cnt>1 即翻盘写盘。
+        v3 新增：ledger（历史复用账本）与 auto（在线死写率闭环调档）。
 
+        信号语义（逗号分隔，静态信号取并集）：
         - share：前缀共享度。ref_cnt>1（≥2 个请求同持 = 前缀主干）才写；
           ref_cnt==1（单请求私有尾缀）暂缓。依据：本池 ref_cnt 只由
           请求分配与前缀命中递增，radix 注册哈希不持引用（block_pool
           ._insert_block_hash），故该判据即"当下是否被共享"。
+        - ledger：该块或其祖先曾从 offload 读回过（历史复用证据）才写。
         - lifecycle：被抢占请求的块无条件写（恢复时省重算）。
+        - auto：由 WriteGateController 的档位决定——relax 全写 / mid
+          share∨ledger / strict 仅 ledger；lifecycle 保底不过控制器。
         """
         signals = self._write_gate_signals
         if not signals:
             return True
         if "lifecycle" in signals and preempted:
             return True
-        if "share" in signals:
-            return gpu_block.ref_cnt > 1
+        if "auto" in signals:
+            tier = self._gate_ctrl.tier if self._gate_ctrl else GATE_RELAX
+            if tier == GATE_RELAX:
+                return True
+            if tier == GATE_MID:
+                return gpu_block.ref_cnt > 1 or ledger_hit
+            return ledger_hit
+        if "share" in signals and gpu_block.ref_cnt > 1:
+            return True
+        if "ledger" in signals and ledger_hit:
+            return True
+        if signals & {"share", "ledger"}:
+            return False
         return True
 
     def prepare_store_specs(
@@ -796,8 +1063,10 @@ class SimpleCPUOffloadScheduler:
             if preempted:
                 state.block_ids = tuple([] for _ in range(num_groups))
                 state.num_stored_blocks = [0] * num_groups
-                # 旧块 id 随抢占失效，重试队列一并清空
+                # 旧块 id 随抢占失效，重试队列与 ledger 前沿一并重置
                 state.gate_pending.clear()
+                state.ledger_front = [0] * num_groups
+                state.ledger_hit_at = [-1] * num_groups
             if new_block_id_groups:
                 for g in range(min(num_groups, len(new_block_id_groups))):
                     if new_block_id_groups[g] is not None:
@@ -825,10 +1094,10 @@ class SimpleCPUOffloadScheduler:
             # Cap to blocks with confirmed KV data.
             aligned_tokens = confirmed_tokens // self.block_size * self.block_size
 
-            # --- Phase 0: WriteGate v2 重试暂缓块（先于新块扫描） ---
+            # --- Phase 0: WriteGate 重试暂缓块（先于新块扫描） ---
             if state.gate_pending:
-                still_pending: list[tuple[int, int]] = []
-                for g, bid in state.gate_pending:
+                still_pending: list[tuple[int, int, int]] = []
+                for g, bid, pos in state.gate_pending:
                     blk = gpu_block_pool.blocks[bid]
                     if blk.is_null or blk.block_hash is None:
                         continue  # 块失效，放弃重试
@@ -840,25 +1109,28 @@ class SimpleCPUOffloadScheduler:
                         is not None
                     ):
                         continue  # 已在写或 CPU 池已有同 hash
-                    if self._write_gate_should_store(blk, preempted):
+                    ledger_hit = (
+                        self._gate_ledger and self._gate_family_hit(state, g, pos)
+                    )
+                    if self._write_gate_should_store(blk, preempted, ledger_hit):
                         if seg_alloc is not None:
                             aff_key = f"g{bid // 32}"
                             cpu_blk = seg_alloc.take_block_affinity(aff_key)
                             if cpu_blk is None:
                                 out_of_space = True
-                                still_pending.append((g, bid))
+                                still_pending.append((g, bid, pos))
                                 continue
                             cpu_blocks_alloc.append(cpu_blk)
                         else:
                             if num_free <= 0:
                                 out_of_space = True
-                                still_pending.append((g, bid))
+                                still_pending.append((g, bid, pos))
                                 continue
                             num_free -= 1
                         gpu_block_ids.append(bid)
                         block_hashes_to_store.append(blk.block_hash)
                     else:
-                        still_pending.append((g, bid))
+                        still_pending.append((g, bid, pos))
                 state.gate_pending = still_pending
 
             for g in range(num_groups):
@@ -874,7 +1146,7 @@ class SimpleCPUOffloadScheduler:
                 ready_blocks_g = aligned_tokens // g_block_size
                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
 
-                for gpu_block_id in scannable:
+                for pos, gpu_block_id in enumerate(scannable, start=already_stored_g):
                     gpu_block = gpu_block_pool.blocks[gpu_block_id]
                     if gpu_block.is_null:
                         advanced_per_group[g] += 1
@@ -898,13 +1170,19 @@ class SimpleCPUOffloadScheduler:
                         advanced_per_group[g] += 1
                         continue
 
-                    # WriteGate v2：逐块写准入。拒绝 = 暂缓入 per-request
-                    # 重试队列（游标照常推进）；每步扫描前重试 pending，
-                    # 兄弟请求 lookup 命中把 ref_cnt 顶上去后翻盘写盘。
+                    # WriteGate v2/v3：逐块写准入。拒绝 = 暂缓入 per-request
+                    # 重试队列（游标照常推进，位置 pos 一并入队供 ledger 祖先
+                    # 查询）；每步扫描前重试 pending，兄弟请求 lookup 命中把
+                    # ref_cnt 顶上去、或前缀家族出现在读回账本后翻盘写盘。
                     # 体积账按 hash 首丢去重（块 id 会被复用，不可作键）。
-                    if not self._write_gate_should_store(gpu_block, preempted):
+                    ledger_hit = (
+                        self._gate_ledger and self._gate_family_hit(state, g, pos)
+                    )
+                    if not self._write_gate_should_store(
+                        gpu_block, preempted, ledger_hit
+                    ):
                         advanced_per_group[g] += 1
-                        state.gate_pending.append((g, gpu_block_id))
+                        state.gate_pending.append((g, gpu_block_id, pos))
                         if bhash_with_group not in self._gate_dropped_hashes:
                             self._gate_dropped_hashes.add(bhash_with_group)
                             n_dropped_req += 1
@@ -973,6 +1251,13 @@ class SimpleCPUOffloadScheduler:
                 len(merged_gpu_block_ids), merged_dropped_blocks,
                 merged_block_hashes,
             )
+            if self._gate_ctrl is not None:
+                # 闭环反馈回路：把本步写盘块推入存活窗，成熟后回算在线死写率，
+                # 由死写率驱动准入档位；档位快照随 profiler 分片落盘。
+                self._gate_ctrl.note_step(
+                    merged_block_hashes, merged_dropped_blocks
+                )
+                profiler.note_gate_state(self._gate_ctrl.snapshot())
 
         return merged_gpu_block_ids, merged_cpu_block_ids, req_ids
 
