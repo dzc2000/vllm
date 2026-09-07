@@ -53,6 +53,7 @@ class SimpleCPUOffloadWorker:
         disk_coalesce_io: bool = True,
         disk_segment_bytes: int = 16 * (1024**2),
         lag_store_steps: int = 0,
+        defer_pending_bytes: int = 0,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -68,6 +69,10 @@ class SimpleCPUOffloadWorker:
         # 依赖节拍税的修复）。lag=1 为纯滞后；lag>=2 为跨步攒批（多步
         # 批合并为单批提交，同时摊薄交错碎片）。0 = 原生行为（A/B 基线）。
         self._lag_store_steps = max(0, int(lag_store_steps))
+        # KVLog WriteGate v6（run6 defer）：pinned pending 池容量（字节，
+        # 0=关闭）。仅 disk 模式生效；与 lag_store_steps 互斥（v6 臂
+        # lag=0，同时设置时 pending store 直接提交并告警）。
+        self._defer_pending_bytes = max(0, int(defer_pending_bytes))
         # 持有中的滞后 store 批：(gpu_blocks, cpu_blocks, event_idx,
         # compute_done_event)。触发提交时只 flush 老化批并合并为单批，
         # 本步刚录事件的最新一批扣住不交（keep=1）。
@@ -227,6 +232,7 @@ class SimpleCPUOffloadWorker:
             self.use_page_cache,
             coalesce_io=self.disk_coalesce_io,
             segment_bytes=self.disk_segment_bytes,
+            defer_pending_bytes=self._defer_pending_bytes,
         )
 
     def _init_cpu_mode(
@@ -319,6 +325,15 @@ class SimpleCPUOffloadWorker:
                     event_idx=metadata.load_event,
                     events_list=self._load_events,
                 )
+            if metadata.v6_load_pairs:
+                # v6 直供 load：pinned pending -> GPU，免盘读；与盘读共用
+                # load 事件（完成回报按 event_idx 水位推进，机制不变）。
+                backend.launch_v6_load(
+                    [p for p, _ in metadata.v6_load_pairs],
+                    [g for _, g in metadata.v6_load_pairs],
+                    metadata.load_event,
+                    self._load_events,
+                )
             if metadata.store_gpu_blocks:
                 if self._lag_store_steps > 0:
                     # 滞后 store：每步新建 Event——持有跨步，不能复用
@@ -354,6 +369,33 @@ class SimpleCPUOffloadWorker:
                 # 本步无新 store：立即排空持有批（步间隙/尾部排空，
                 # 避免最后一批滞留到引擎关闭）
                 self._submit_lagged(backend)
+            if metadata.v6_store_pairs and metadata.store_event >= 0:
+                # v6 入池 DMA（GPU -> pinned pending，不落盘）。与 lag 互斥：
+                # 同时设置时直接提交并告警（v6 臂应 lag=0）。compute-done
+                # 依赖与原生 store 同式——store DMA 读活 KV cache。
+                if self._lag_store_steps > 0:
+                    logger.warning(
+                        "v6 defer 与 lag_store_steps 互斥：pending store "
+                        "绕过滞后路径直接提交")
+                if self._store_compute_done is None:
+                    self._store_compute_done = torch.Event()
+                self._store_compute_done.record(torch.cuda.current_stream())
+                backend.launch_v6_store(
+                    [g for g, _ in metadata.v6_store_pairs],
+                    [p for _, p in metadata.v6_store_pairs],
+                    metadata.store_event,
+                    self._store_events,
+                    self._store_compute_done,
+                )
+            if metadata.v6_flush_pairs and metadata.store_event >= 0:
+                # v6 兑现落盘（pinned pending -> 盘，pwritev，无 GPU 参与）；
+                # 与本步 store 批共用 event_idx，完成回报走原路径。
+                backend.launch_v6_flush(
+                    [p for p, _ in metadata.v6_flush_pairs],
+                    [d for _, d in metadata.v6_flush_pairs],
+                    metadata.store_event,
+                    self._store_events,
+                )
 
         # (2) Track completed transfer events
         finished_recving: set[str] = set()

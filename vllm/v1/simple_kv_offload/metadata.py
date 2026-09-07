@@ -37,6 +37,13 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     # Whether any requests were preempted this step and need flush pending transfers.
     need_flush: bool = False
 
+    # KVLog WriteGate v6（run6 defer）：(gpu_block, pending_slot) 入池 DMA；
+    # (pending_slot, gpu_block) 内存直供 load；(pending_slot, disk_slot)
+    # 首读兑现落盘。与 store/load 事件共用 event_idx，完成回报走原路径。
+    v6_store_pairs: list[tuple[int, int]] = field(default_factory=list)
+    v6_load_pairs: list[tuple[int, int]] = field(default_factory=list)
+    v6_flush_pairs: list[tuple[int, int]] = field(default_factory=list)
+
 
 @dataclass
 class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):

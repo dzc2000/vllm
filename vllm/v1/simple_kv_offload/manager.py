@@ -52,6 +52,142 @@ class LoadRequestState:
     transfer_meta: TransferMeta
     load_event: int | None = None
     finished: bool = False
+    # WriteGate v6：直供 load 对 (pending_slot, gpu_block) 与命中 pin 的
+    # hash 列表（load 完成后释放 pin，见 _cleanup_load_request）。
+    v6_pairs: list = field(default_factory=list)
+    pending_pins: list = field(default_factory=list)
+
+
+class _DeferPendingPool:
+    """WriteGate v6（run6 defer）延迟写池：调度侧纯账本。
+
+    数据本体在 worker 侧 pinned pending 缓冲（DiskBackend），本类只记
+    hash -> 槽位与状态机。构造性不变量 INV1：落盘只经首读兑现
+    （_v6_redeem），pending 未读块最坏路径 = 重算，永不落盘。
+
+    状态机（per hash）：
+      inflight（DMA 入池未完成，不可命中）
+      -> settled（可命中）
+      -> pinned（命中/落盘保护中，LRU 不可逐出）
+      -> flushed（盘上有副本；条目保留为 RAM 缓存直至 LRU 逐出）
+    LRU 逐出未 flush 条目 = 丢弃（数据消失，重算兜底，经 on_drop 计入
+    体积账 dropped_blocks，unique-hash 去重）；丢无可丢（全 pinned/
+    inflight）时拒绝新入池 = 最终丢弃。丢弃后的 hash 被重算（= 需求
+    证据）可再次入池（二次机会，不重复计数）。
+    """
+
+    def __init__(self, cap_slots: int, on_drop=None) -> None:
+        self.cap = max(0, int(cap_slots))
+        self._slot: dict[bytes, int] = {}  # hash -> pending 槽位
+        self._lru: dict[bytes, None] = {}  # 插入序即 LRU 序（touch 重插）
+        self._free: list[int] = list(range(self.cap))[::-1]
+        self.inflight: set[bytes] = set()
+        self.pinned: dict[bytes, int] = {}  # hash -> pin 计数
+        self.flushed: set[bytes] = set()
+        self.dropped: set[bytes] = set()
+        self._on_drop = on_drop
+        # 计数器（判卷护栏与分列字段的原始数据）
+        self.admits = 0
+        self.hits = 0
+        self.drops = 0
+        self.flushes = 0
+        self.dropped_then_requested = 0
+        self.peak = 0
+
+    def contains(self, h: bytes) -> bool:
+        return h in self._slot
+
+    def touch(self, h: bytes) -> None:
+        if h in self._lru:
+            del self._lru[h]
+            self._lru[h] = None  # 重插到尾 = MRU
+
+    def _drop(self, h: bytes) -> None:
+        if h not in self.dropped:
+            self.dropped.add(h)
+            self.drops += 1
+            if self._on_drop is not None:
+                self._on_drop(h)
+
+    def _evict_one(self) -> bool:
+        for h in self._lru:  # dict 序 = LRU 序，从最老开始
+            if self.pinned.get(h, 0) > 0 or h in self.inflight:
+                continue
+            slot = self._slot.pop(h)
+            del self._lru[h]
+            self._free.append(slot)
+            if h not in self.flushed:
+                self._drop(h)  # 未 flush：数据消失，重算兜底
+            # 已 flush：盘上有副本，逐出无损（hash 仍可从 CPU 池发现）
+            return True
+        return False  # 全被 pin/inflight：丢无可丢
+
+    def admit(self, h: bytes) -> bool:
+        """块入池（inflight 态）。满时先 LRU 丢最老未读；丢无可丢则拒绝。"""
+        if h in self._slot:
+            self.touch(h)
+            return True
+        if not self._free and not self._evict_one():
+            self._drop(h)  # 池满拒绝 = 最终丢弃（重算兜底）
+            return False
+        slot = self._free.pop()
+        self._slot[h] = slot
+        self._lru[h] = None
+        self.inflight.add(h)
+        self.admits += 1
+        self.peak = max(self.peak, len(self._slot))
+        return True
+
+    def settle(self, hashes: list[bytes]) -> None:
+        """store 事件完成：入池 DMA 数据就绪，hash 变为可命中。"""
+        for h in hashes:
+            self.inflight.discard(h)
+
+    def hittable(self, h: bytes) -> bool:
+        return h in self._slot and h not in self.inflight
+
+    def pin(self, h: bytes) -> "int | None":
+        """命中：返回槽位并 pin（兑现完成前 LRU 不可逐出）。"""
+        if not self.hittable(h):
+            return None
+        self.pinned[h] = self.pinned.get(h, 0) + 1
+        self.hits += 1
+        self.touch(h)
+        return self._slot[h]
+
+    def pin_protect(self, h: bytes) -> None:
+        """落盘期间的槽位保护（非命中计数）：pwritev 未完成前 LRU 不可逐出。"""
+        if h in self._slot:
+            self.pinned[h] = self.pinned.get(h, 0) + 1
+
+    def unpin(self, h: bytes) -> None:
+        n = self.pinned.get(h, 0)
+        if n <= 1:
+            self.pinned.pop(h, None)
+        else:
+            self.pinned[h] = n - 1
+
+    def mark_flushed(self, h: bytes) -> None:
+        self.flushed.add(h)
+
+    def slot_of(self, h: bytes) -> "int | None":
+        return self._slot.get(h)
+
+    def snapshot(self) -> dict:
+        return {
+            "enabled": self.cap > 0,
+            "cap_slots": self.cap,
+            "resident": len(self._slot),
+            "inflight": len(self.inflight),
+            "pinned": sum(1 for n in self.pinned.values() if n > 0),
+            "admits": self.admits,
+            "pending_hits": self.hits,
+            "drops": self.drops,
+            "flushes": self.flushes,
+            "dropped_set": len(self.dropped),
+            "dropped_then_requested": self.dropped_then_requested,
+            "pending_peak": self.peak,
+        }
 
 
 # NOTE: This per-request state is only used in eager mode.
@@ -263,6 +399,33 @@ GATE_RELAX = "relax"
 GATE_MID = "mid"
 GATE_STRICT = "strict"
 
+# --- WriteGate v4（F1+F3）：开关、在线头保护窗 K、死头否决名单参数 -----------
+# v4 把 auto 从"单一死写率驱动三档"改成"头/尾分窗 + 在线位置保护"：
+#   F1 迟到命中复结算 —— 结算为死的块之后又被读回，则改判为活（在线口径
+#      与论文体积账"任何时点命中即活"对齐，消掉 run3 实测 0.836 vs 0.562 的偏差）；
+#   F3 头保护 + 在线 K —— 前缀头部 K 块无条件写（破 ledger 冷启动死锁），
+#      K 由头窗死写率乘性调节，种子取 bud64 这个安全下界，让"手调 K"变成控制器不动点；
+#   F3 死头否决 —— 越过 horizon 仍没人读回的头块进名单，只降级它的头通道特权
+#      （证据通道照常），专治 bud512 式大 K 的 churn 放大（amp 3.637）。
+# 默认关闭（VLLM_GATE_V4=1 打开），关闭时 v3 行为逐字节不变。
+GATE_V4_DEFAULT = __import__("os").environ.get("VLLM_GATE_V4", "0") == "1"
+GATE_K_SEED = 64  # 头保护窗初值（= run3 里唯一没判负的手调档）
+GATE_K_MIN = 16
+GATE_K_MAX = 4096
+GATE_VETO_TTL_MULT = 8  # 否决有效期 = 8 x horizon，到期自动出名单
+GATE_VETO_MAX = 131072  # 名单容量上限，超了按 FIFO 驱逐最老的
+
+# --- WriteGate v5（run5 / F1-lite）：有界复结算，F3 零残留 ---------------------
+# run4 尸检给出的分工：F1（迟到命中）是药——h1 上把读回抬到 29039、超过一切
+# 静态点；F3（头保护 K）是毒——无条件写把 writes 撑爆 +16k~+28k、被 bud256
+# 双端支配。v5 只留 F1 的信号源（读侧逻辑命中），改成更轻的有界形式：
+#   一块没有账本证据、但读侧已出现过逻辑命中 -> 领一次重写特权。
+#   领过的块进一次性集合永久除名；再死即永久死，回 v3 原证据通道。
+#   不引入 K/否决/分窗——闭环仍是 v3 的三档，v5 只补它冷启动时看不见的那批块。
+# 默认关闭（VLLM_GATE_V5=1 打开），关闭时 v3/v4 行为逐字节不变。
+GATE_V5_DEFAULT = __import__("os").environ.get("VLLM_GATE_V5", "0") == "1"
+GATE_V5_GRANT_MAX = 524288  # 一次性特权集合容量，超了按 FIFO 驱逐最老的
+
 
 class WriteGateController:
     """按在线死写率调节写准入激进度的反馈控制器（提案 §5.3 待接项）。
@@ -302,6 +465,8 @@ class WriteGateController:
         window_blocks: int = 2048,
         eval_every_blocks: int = 2048,
         freeze_steps: int = 200,
+        v4=None,
+        v5=None,
     ) -> None:
         self.horizon = horizon_blocks
         self.eval_every = eval_every_blocks
@@ -323,6 +488,32 @@ class WriteGateController:
         self._tiers_seen: set[str] = {GATE_RELAX}
         self._trajectory: list[dict] = []
         self._max_trajectory = 64
+        # --- v4 状态（v4_enabled=False 时全部闲置，v3 路径零开销） -----------
+        self.v4_enabled = GATE_V4_DEFAULT if v4 is None else bool(v4)
+        self.protect_blocks = GATE_K_SEED  # 在线头保护窗 K
+        # 分窗结算样本：[dead, hash]，用 list 而非 int 是为了能就地改判（F1）
+        self._head_verdicts: deque[list] = deque(maxlen=window_blocks)
+        self._tail_verdicts: deque[list] = deque(maxlen=window_blocks)
+        # 写准入时登记的通道归属：hash -> "head"|"tail"，成熟时 pop 分窗
+        self._kind: dict[bytes, str] = {}
+        self._veto: dict[bytes, int] = {}  # hash -> 过期的 _seq 值
+        self._veto_hits: dict[bytes, int] = {}  # 入名单时的命中数快照
+        self._veto_order: deque[bytes] = deque()
+        self._veto_ttl = GATE_VETO_TTL_MULT * horizon_blocks
+        self._veto_max = GATE_VETO_MAX
+        self.head_dead_rate = 0.0
+        self.tail_dead_rate = 0.0
+        self.k_grows = 0
+        self.k_shrinks = 0
+        self.revisits = 0  # F1：改判为活的块数
+        self.veto_saved = 0  # 否决期出现迟到命中而翻案出名单
+        self.veto_expired = 0  # TTL 到期自然出名单
+        # --- v5 状态（v5_enabled=False 时全部闲置，v3/v4 路径零开销） --------
+        self.v5_enabled = GATE_V5_DEFAULT if v5 is None else bool(v5)
+        self._v5_granted: set[bytes] = set()  # 已消耗重写特权的块（一次性）
+        self._v5_grant_order: deque[bytes] = deque()  # 触顶时 FIFO 驱逐顺序
+        self._v5_grant_max = GATE_V5_GRANT_MAX
+        self.v5_grants = 0  # 累计授予次数（每块至多一次，与集合大小同源）
 
     # --- 回路入口：每次写准入扫描后调用一次 ---------------------------------
 
@@ -343,6 +534,16 @@ class WriteGateController:
             self.dead_total += dead
             self._due += 1
             matured += 1
+            if self.v4_enabled:
+                # v4：按写入时的通道归属分窗（头窗驱动 K，尾窗驱动档位）。
+                # 没登记过的（gate 之外的写、或 _kind 兜底清空过）计入尾窗。
+                kind = self._kind.pop(h, "tail")
+                if kind == "head":
+                    self._head_verdicts.append([dead, h])
+                    if dead:
+                        self._add_veto(h)
+                else:
+                    self._tail_verdicts.append([dead, h])
 
         if matured or self._seen_drops == 0 or self.tier == GATE_RELAX:
             self._frozen = 0
@@ -359,6 +560,9 @@ class WriteGateController:
     # --- 档位迁移 -----------------------------------------------------------
 
     def _rebalance(self) -> None:
+        if self.v4_enabled:
+            self._rebalance_v4()
+            return
         if len(self._verdicts) < self.eval_every:
             return  # 样本不足，保持当前档
         rate = sum(self._verdicts) / len(self._verdicts)
@@ -409,10 +613,183 @@ class WriteGateController:
             reason,
         )
 
+    # --- v4：头/尾分窗闭环 ---------------------------------------------------
+
+    def _snapshot_v4(self) -> dict:
+        # v4 观测项：在线 K 及其动作、两个窗的死写率、F1 改判、否决名单流水
+        return {
+            "v4": True,
+            "protect_blocks": self.protect_blocks,
+            "k_grows": self.k_grows,
+            "k_shrinks": self.k_shrinks,
+            "head_dead_rate": round(self.head_dead_rate, 4),
+            "tail_dead_rate": round(self.tail_dead_rate, 4),
+            "head_window_size": len(self._head_verdicts),
+            "revisits": self.revisits,
+            "veto_size": len(self._veto),
+            "veto_saved": self.veto_saved,
+            "veto_expired": self.veto_expired,
+        }
+
+    def _add_veto(self, bhash) -> None:
+        # 死头块进否决名单：记 TTL 与"入名单时的命中数"，之后命中数一旦增长
+        # 就说明这块其实有用（迟到命中），当场翻案出名单。
+        if bhash in self._veto:
+            return
+        while len(self._veto) >= self._veto_max and self._veto_order:
+            old = self._veto_order.popleft()
+            if self._veto.pop(old, None) is not None:
+                self._veto_hits.pop(old, None)
+        self._veto[bhash] = self._seq + self._veto_ttl
+        self._veto_hits[bhash] = profiler.hit_counts([bhash])[0]
+        self._veto_order.append(bhash)
+
+    def _vetoed(self, bhash) -> bool:
+        exp = self._veto.get(bhash)
+        if exp is None:
+            return False
+        if self._seq >= exp:
+            self._veto.pop(bhash, None)
+            self._veto_hits.pop(bhash, None)
+            self.veto_expired += 1
+            return False
+        if profiler.hit_counts([bhash])[0] > self._veto_hits.get(bhash, 0):
+            self._veto.pop(bhash, None)
+            self._veto_hits.pop(bhash, None)
+            self.veto_saved += 1
+            return False
+        return True
+
+    def decide_auto(self, gpu_block, ledger_hit: bool, bhash, pos: int) -> bool:
+        # v4 的 auto 判据。头通道：pos 在保护窗内即无条件写（破 ledger 冷启动
+        # 死锁），除非它已被否决（否决只剥夺头特权，证据通道照常放行）。
+        # 被否决的头块必须继续走证据通道，因为它正是"头特权被证伪"的那批。
+        head = bhash is not None and 0 <= pos < self.protect_blocks
+        if head and self._vetoed(bhash):
+            head = False
+        if self.tier == GATE_RELAX:
+            ok = True
+        elif head:
+            ok = True
+        elif self.tier == GATE_MID:
+            ok = gpu_block.ref_cnt > 1 or ledger_hit
+        else:
+            ok = ledger_hit
+        if ok and bhash is not None:
+            # 放行才登记：暂缓的块下一步重扫时还会再来，届时再登记。
+            # 兜底：被 out_of_space 打断等原因残留的条目不该无限增长，宁可丢标签
+            # （丢了下一次按 tail 统计，只是少一份头窗证据，不影响正确性）。
+            if len(self._kind) > 262144:
+                self._kind.clear()
+            self._kind[bhash] = "head" if head else "tail"
+        return ok
+
+    def _resettle(self, window) -> None:
+        # F1：结算为死、之后又被读回 -> 就地改判为活（与论文口径一致）。
+        for v in window:
+            if v[0] and profiler.was_ever_hit(v[1]):
+                v[0] = 0
+                self.revisits += 1
+
+    def _rebalance_v4(self) -> None:
+        self._resettle(self._tail_verdicts)
+        self._resettle(self._head_verdicts)
+        self._rebalance_tier_v4()
+        self._rebalance_k_v4()
+
+    def _rebalance_tier_v4(self) -> None:
+        # 档位只由**尾窗**（纯证据通道）驱动，且 v4 去掉 v3 的 mid->relax 回退：
+        # mid 期的低死写率本来就是"只写有证据的块"造出来的，拿它当放松回去的理由
+        # 是自证伪（棘轮只收紧）。回退仍保留给冻结通道（strict->mid）。
+        if len(self._tail_verdicts) < self.eval_every:
+            return
+        rate = sum(v[0] for v in self._tail_verdicts) / len(self._tail_verdicts)
+        self.dead_rate = rate
+        self.tail_dead_rate = rate
+        if self.tier == GATE_RELAX:
+            if rate >= self.UP_TO_MID:
+                self._move(GATE_MID, rate, "dead_rate_v4")
+        elif self.tier == GATE_MID:
+            if rate >= self.UP_TO_STRICT:
+                self._move(GATE_STRICT, rate, "dead_rate_v4")
+
+    def _rebalance_k_v4(self) -> None:
+        # 头保护窗 K 只由**头窗**驱动，乘性收缩/翻倍（界内钳位）。头窗样本攒得比
+        # 尾窗慢（头块只占前缀的一小段），所以这里的 eval_every 复用同一节流值。
+        # 迟滞带沿用 UP_TO_MID / DOWN_TO_RELAX，带内不动，避免 K 来回摆。
+        if len(self._head_verdicts) < self.eval_every:
+            return
+        rate = sum(v[0] for v in self._head_verdicts) / len(self._head_verdicts)
+        self.head_dead_rate = rate
+        if rate >= self.UP_TO_MID:
+            shrink = max(GATE_K_MIN, self.protect_blocks // 2)
+            self._k_move(min(self.protect_blocks, shrink), rate, "head_dead")
+        elif rate <= self.DOWN_TO_RELAX:
+            grow = min(GATE_K_MAX, self.protect_blocks * 2)
+            self._k_move(max(self.protect_blocks, grow), rate, "head_alive")
+
+    def _k_move(self, target: int, rate: float, reason: str) -> None:
+        prev = self.protect_blocks
+        if target == prev:
+            return  # 已顶到界，不记动作
+        if target < prev:
+            self.k_shrinks += 1
+        else:
+            self.k_grows += 1
+        self.protect_blocks = target
+        logger.info(
+            "WriteGate v4: 头保护窗 K %d -> %d (头窗死写率 %.3f, 成熟 %d 块, %s)",
+            prev,
+            target,
+            rate,
+            len(self._head_verdicts),
+            reason,
+        )
+
+    # --- v5（F1-lite）：有界重写特权 ------------------------------------------
+
+    def grant_rewrite(self, bhash, ledger_hit: bool) -> bool:
+        """F1-lite 判据：迟到命中的翻案，但每块的重写特权只发一次。
+
+        授予条件（四连，缺一不领）：
+          1. bhash 在场且此前没领过（一次性是本机制的全部 bounded 语义）；
+          2. 没有账本证据（有 ledger 的块本来就会从 v3 原通道放行，
+             不该消耗特权、也不该被记进一次性集合）；
+          3. 读侧出现过逻辑命中 was_ever_hit（独立于写盘，破冷启动死锁
+             的证据源：strict 下"没写过->没读回->永远没账本"的死循环，
+             唯一能证明这块有用的信号只剩逻辑命中）。
+        领过之后块若再次死掉，本判据恒 False——回落到 v3 的三档判断，
+        该拒就拒。不做翻案回收（v4 的 _resettle/veto 那套这里全没有）。
+        """
+        if bhash is None or ledger_hit:
+            return False
+        if bhash in self._v5_granted:
+            return False
+        if not profiler.was_ever_hit(bhash):
+            return False
+        while len(self._v5_granted) >= self._v5_grant_max and self._v5_grant_order:
+            # 触顶按 FIFO 驱逐最老的，而不是 clear：clear 会把老块的特权
+            # 重新发出去，一次性语义就没了。run4 量级 unique ~30k，远不到顶。
+            old = self._v5_grant_order.popleft()
+            self._v5_granted.discard(old)
+        self._v5_granted.add(bhash)
+        self._v5_grant_order.append(bhash)
+        self.v5_grants += 1
+        return True
+
+    def _snapshot_v5(self) -> dict:
+        # v5 观测项：授予次数与一次性集合规模（判卷只读 summary，这些
+        # 键进 pid 分片，供尸检核对"翻转量是否补上 v3 缺的 1.3~4.4%"）
+        return {
+            "v5": True,
+            "v5_grants": self.v5_grants,
+            "v5_granted_size": len(self._v5_granted),
+        }
+
     # --- 可观测性 -----------------------------------------------------------
 
     def snapshot(self) -> dict:
-        return {
+        out = {
             "tier": self.tier,
             "tiers_seen": sorted(self._tiers_seen),
             "transitions": self.transitions,
@@ -427,6 +804,11 @@ class WriteGateController:
             "eval_every_blocks": self.eval_every,
             "trajectory": list(self._trajectory),
         }
+        if self.v4_enabled:
+            out.update(self._snapshot_v4())
+        if self.v5_enabled:
+            out.update(self._snapshot_v5())
+        return out
 
 
 class SimpleCPUOffloadScheduler:
@@ -442,6 +824,9 @@ class SimpleCPUOffloadScheduler:
         lazy_offload: bool = False,
         disk_capacity_bytes: int = 0,
         write_gate_signals: str = "",
+        hicache_min_hits: int = 1,
+        trt_keep_head_blocks: int = 0,
+        defer_pending_bytes: int = 0,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -499,19 +884,77 @@ class SimpleCPUOffloadScheduler:
         }
         # WriteGate v2：首丢 hash 集合（体积账去重键；hash 内容寻址稳定）
         self._gate_dropped_hashes: set[bytes] = set()
+        # 语义基线参数：hicache = 块自身历史读回数 >= 阈值才写（SGLang
+        # HiCache selective write-back 口径，按块不查祖先）；trtprio = 块在
+        # 前缀中的位置落在 head 窗内才写（TRT-LLM 静态优先级/头前缀保留的
+        # 近似，K=0 时该信号等价全拒，需配 share/ledger 之一并集使用）。
+        self._hicache_min_hits = max(1, int(hicache_min_hits))
+        self._trt_keep_head_blocks = max(0, int(trt_keep_head_blocks))
+        # --- WriteGate v6（run6 defer）：延迟写 + 首读兑现 -------------------
+        # defer_pending_bytes > 0 时激活（经 extra_config 的 defer_pending_gib
+        # 换算，环境变量在 EngineCore 子进程不可靠）。仅 disk+eager 生效；
+        # 激活后 eager 扫描的块全部改道 pending 池，逐块 gate 被旁路，
+        # 落盘只经首读兑现（INV1）。与 v3/v4/v5 信号正交、与 lag 互斥。
+        self._v6_pool: _DeferPendingPool | None = None
+        self._v6_store_events: dict[int, tuple[list[int], list[bytes]]] = {}
+        self._v6_flush_events: dict[int, list[tuple[bytes, int]]] = {}
+        self._v6_hit_pins: dict[str, tuple[list[bytes], list[int]]] = {}
+        self._v6_store_outbox: list[tuple[int, int]] = []
+        self._v6_store_event_rec: tuple[list[int], list[bytes]] = ([], [])
+        self._v6_flush_outbox: list[tuple[int, int]] = []
+        self._v6_flush_event_rec: list[tuple[bytes, int]] = []
+        if defer_pending_bytes > 0:
+            if disk_capacity_bytes <= 0:
+                logger.warning(
+                    "WriteGate v6 defer 仅支持 disk 模式，defer_pending_bytes"
+                    "=%d 被忽略", defer_pending_bytes)
+            elif lazy_offload:
+                logger.warning(
+                    "WriteGate v6 defer 仅支持 eager 路径，defer_pending_bytes"
+                    "=%d 被忽略", defer_pending_bytes)
+            elif self.hash_block_size != self.fa_block_size:
+                raise ValueError(
+                    "WriteGate v6 defer 要求 hash_block_size == fa_block_size"
+                    f"（{self.hash_block_size} != {self.fa_block_size}）")
+            else:
+                offload_capacity = (
+                    disk_capacity_bytes if disk_capacity_bytes > 0
+                    else cpu_capacity_bytes
+                )
+                # 反推块字节：num_cpu_blocks = floor(n_gpu*C//G) <= floor(C//B)
+                # => C//num_cpu_blocks >= B，本侧槽位数 <= worker 侧缓冲槽数
+                # （只会少用不会越界，方向安全；实际 2 的幂配置下两者相等）。
+                block_bytes = max(
+                    1, offload_capacity // max(1, self.num_cpu_blocks))
+                slots = defer_pending_bytes // block_bytes
+                self._v6_pool = _DeferPendingPool(
+                    slots,
+                    on_drop=(lambda h: profiler.note_store_decision(0, 1, []))
+                    if profiler.PROFILE else None,
+                )
+                logger.info(
+                    "SimpleCPUOffloadScheduler: WriteGate v6 defer 池 %d 槽"
+                    "（%.2f GiB，block=%d B）—— 落盘仅经首读兑现（INV1）",
+                    slots, defer_pending_bytes / (1024**3), block_bytes)
         # WriteGate v3：ledger（历史复用账本）与 auto（闭环控制器）都以
         # profiler 的读回命中表为唯一数据源。profiler 未开时该表恒空，
         # "无数据"会被误判成"无命中"而把写全部拒掉，故此处显式降级并告警。
         self._gate_ledger = bool(self._write_gate_signals & {"ledger", "auto"})
         self._gate_ctrl: WriteGateController | None = None
-        if self._gate_ledger and not profiler.PROFILE:
+        # hicache 与 ledger/auto 同源（profiler 读回命中表）：未开 profile
+        # 时 hit_counts 恒 0，会把写全拒掉，故一并显式降级。
+        if (
+            self._write_gate_signals & {"ledger", "auto", "hicache"}
+            and not profiler.PROFILE
+        ):
             logger.warning(
                 "WriteGate signals %s 依赖 kvlog_profile 在线账本，但 profiler "
-                "未激活 -> 丢弃 ledger/auto 信号，退化为 %s",
+                "未激活 -> 丢弃 ledger/auto/hicache 信号，退化为 %s",
                 sorted(self._write_gate_signals),
-                sorted(self._write_gate_signals - {"ledger", "auto"}) or "关闭",
+                sorted(self._write_gate_signals - {"ledger", "auto", "hicache"})
+                or "关闭",
             )
-            self._write_gate_signals -= {"ledger", "auto"}
+            self._write_gate_signals -= {"ledger", "auto", "hicache"}
             self._gate_ledger = False
         if "auto" in self._write_gate_signals:
             self._gate_ctrl = WriteGateController()
@@ -689,6 +1132,11 @@ class SimpleCPUOffloadScheduler:
         # is dropped first.
         if stale := self._pending_cpu_hits.pop(request.request_id, None):
             self._free_pending_cpu_hit(stale)
+        # v6：上一轮调度遗留的命中 pin 释放（同请求重试/取消路径）
+        if (stale_v6 := self._v6_hit_pins.pop(request.request_id, None)) \
+                is not None and self._v6_pool is not None:
+            for h in stale_v6[0]:
+                self._v6_pool.unpin(h)
 
         num_skipped_hashes = num_computed_tokens // self.hash_block_size
         remaining_hashes = request.block_hashes[num_skipped_hashes:]
@@ -703,6 +1151,13 @@ class SimpleCPUOffloadScheduler:
         cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(
             remaining_hashes, max_hit_len
         )
+
+        if self._v6_pool is not None:
+            served = self._v6_try_serve_from_pending(
+                request.request_id, remaining_hashes, max_hit_len,
+                cpu_hit_blocks, hit_length)
+            if served is not None:
+                return served, True
 
         if hit_length > 0:
             pin_blocks = [
@@ -755,9 +1210,20 @@ class SimpleCPUOffloadScheduler:
                     req_id,
                 )
                 self._free_pending_cpu_hit(pending)
+            v6_pin = self._v6_hit_pins.pop(req_id, None)
+            if v6_pin is not None and self._v6_pool is not None:
+                for h in v6_pin[0]:
+                    self._v6_pool.unpin(h)
             return
 
         if pending is None:
+            # --- v6：纯 pending 命中的兑现（内存直供 + 首读落盘） -----------
+            v6_pin = self._v6_hit_pins.pop(req_id, None)
+            if v6_pin is not None:
+                self._v6_redeem(
+                    req_id, request, block_ids_by_group, blocks,
+                    num_external_tokens, v6_pin)
+                return
             logger.warning(
                 "SimpleCPUOffloadScheduler: update_state_after_alloc called "
                 "for req_id=%s with num_external_tokens=%d but no pending "
@@ -850,6 +1316,163 @@ class SimpleCPUOffloadScheduler:
             request=request, transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids)
         )
 
+    def _v6_try_serve_from_pending(
+        self,
+        req_id: str,
+        remaining_hashes: list,
+        max_hit_len: int,
+        cpu_hit_blocks: tuple,
+        cpu_hit_len: int,
+    ) -> "int | None":
+        """v6 命中裁决（run6 预登记读口径：pending 直供计入 reads）。
+
+        裁决 1：盘命中的块整段仍驻 pending RAM -> 全量直供（免盘读，
+        复读也走内存）；裁决 2：无盘命中 -> 从头走 pending 连续 run。
+        mixed（盘命中 + pending 尾缀）不扩展：尾部重算、不落盘
+        （未读不写，INV1 不破坏），是本实现的已知边界。
+        """
+        pool = self._v6_pool
+        assert pool is not None
+        hbs = self.hash_block_size
+        n_max = max_hit_len // hbs
+        if n_max <= 0:
+            return None
+        if cpu_hit_len > 0:
+            hashes = [
+                blk.block_hash
+                for grp in cpu_hit_blocks
+                for blk in grp
+                if not blk.is_null and blk.block_hash is not None
+            ]
+            n_cpu = cpu_hit_len // hbs
+            if n_cpu <= 0 or len(hashes) != n_cpu:
+                return None
+            if not all(pool.hittable(h) for h in hashes):
+                return None
+            slots: list[int] = []
+            for h in hashes:
+                s = pool.pin(h)
+                if s is None:
+                    for hh in hashes[:len(slots)]:
+                        pool.unpin(hh)
+                    return None
+                slots.append(s)
+            if profiler.PROFILE:
+                profiler.note_block_loads(hashes)
+            self._v6_hit_pins[req_id] = (hashes, slots)
+            return n_cpu * hbs
+        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+        keys = [
+            make_block_hash_with_group_id(h, self.fa_gidx)
+            for h in remaining_hashes[:n_max]
+        ]
+        n_ext = 0
+        for k in keys:
+            if not pool.hittable(k):
+                if k in pool.dropped:
+                    pool.dropped_then_requested += 1
+                break
+            n_ext += 1
+        if n_ext == 0:
+            return None
+        hashes = keys[:n_ext]
+        slots = []
+        for h in hashes:
+            s = pool.pin(h)
+            if s is None:
+                for hh in hashes[:len(slots)]:
+                    pool.unpin(hh)
+                return None
+            slots.append(s)
+        if profiler.PROFILE:
+            profiler.note_block_loads(hashes)
+        self._v6_hit_pins[req_id] = (hashes, slots)
+        return n_ext * hbs
+
+    def _v6_redeem(
+        self,
+        req_id: str,
+        request: "Request",
+        block_ids_by_group,
+        blocks: "KVCacheBlocks",
+        num_external_tokens: int,
+        v6_pin: tuple,
+    ) -> None:
+        """v6 兑现：pending 内存直供 + 首读触发的落盘（写侧唯一出口）。
+
+        INV1 构造点：flush 只在此发生，而此处每个 hash 都刚被 pin 过
+        （>=1 次读），故落盘块死写率恒 0——判卷可直接核验
+        volume.dead_blocks == 0。盘池满时本次不落盘（驻留 RAM，
+        下次命中重试），INV1 不破坏。
+        """
+        pool = self._v6_pool
+        assert pool is not None
+        hashes, slots = v6_pin
+        n_take = num_external_tokens // self.hash_block_size
+        assert n_take > 0
+        for h in hashes[n_take:]:  # 调度器少收的尾部退 pin
+            pool.unpin(h)
+        hashes = list(hashes[:n_take])
+        slots = list(slots[:n_take])
+
+        g = self.fa_gidx
+        g_block_size = (
+            self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec.block_size
+            * self.cp_world_size
+        )
+        assert num_external_tokens % g_block_size == 0
+        n_ext_g = num_external_tokens // g_block_size
+        num_cached_fa_blocks = sum(
+            blk.block_hash is not None for blk in blocks.blocks[self.fa_gidx]
+        )
+        num_computed_tokens = num_cached_fa_blocks * self.fa_block_size
+        total_computed_tokens = num_computed_tokens + num_external_tokens
+        n_computed_g = cdiv(total_computed_tokens, g_block_size)
+        gpu_ext_start = n_computed_g - n_ext_g
+        group_gpu_ids = block_ids_by_group[g]
+
+        load_pairs: list[tuple[int, int]] = []
+        flushed_now: list[bytes] = []
+        seg_alloc = self._disk_seg_alloc
+        for i, (h, pslot) in enumerate(zip(hashes, slots)):
+            gpu_id = group_gpu_ids[gpu_ext_start + i]
+            load_pairs.append((pslot, gpu_id))
+            if h in pool.flushed:
+                continue
+            cpu_blk = None
+            if seg_alloc is not None:
+                aff_key = f"g{gpu_id // 32}"
+                cpu_blk = seg_alloc.take_block_affinity(aff_key)
+            elif self.cpu_block_pool.get_num_free_blocks() > 0:
+                cpu_blk = self.cpu_block_pool.get_new_blocks(1)[0]
+            if cpu_blk is None:
+                continue  # 盘池满：不落盘，驻留 RAM 待下次命中重试
+            cpu_blk._block_hash = h  # type: ignore[assignment]
+            pool.mark_flushed(h)
+            pool.pin_protect(h)  # pwritev 完成前 LRU 不可逐出该槽
+            pool.flushes += 1
+            flushed_now.append(h)
+            self._v6_flush_outbox.append((pslot, cpu_blk.block_id))
+            self._v6_flush_event_rec.append((h, cpu_blk.block_id))
+
+        # GPU 块在异步直供 DMA 期间防复用（与原生 load 路径同式 touch）
+        assert self._gpu_block_pool is not None
+        gpu_ids = [gid for _, gid in load_pairs]
+        self._gpu_block_pool.touch(
+            [self._gpu_block_pool.blocks[bid] for bid in gpu_ids]
+        )
+        if profiler.PROFILE and flushed_now:
+            # 体积账：兑现写 = 真实落盘（stored_blocks 只在此增长）；
+            # 死写核验：flush 时该 hash 已有 >=1 次读（pin 时已记账）。
+            profiler.note_store_decision(len(flushed_now), 0, flushed_now)
+        assert self._reqs_to_load.get(req_id) is None
+        self._reqs_to_load[req_id] = LoadRequestState(
+            request=request,
+            transfer_meta=TransferMeta(gpu_ids, []),
+            v6_pairs=load_pairs,
+            pending_pins=list(hashes),
+        )
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -857,12 +1480,18 @@ class SimpleCPUOffloadScheduler:
         # --- Stores ---
         store_event = -1
         store_gpu, store_cpu, store_req_ids = self.prepare_store_specs(scheduler_output)
-        if store_gpu:
+        v6_store_pairs = self._v6_store_outbox
+        v6_flush_pairs = self._v6_flush_outbox
+        if store_gpu or v6_store_pairs or v6_flush_pairs:
             store_event = self._store_event_counter
             self._store_event_counter += 1
             self._store_event_to_blocks[store_event] = TransferMeta(
                 store_gpu, store_cpu
             )
+            if v6_store_pairs:
+                self._v6_store_events[store_event] = self._v6_store_event_rec
+            if v6_flush_pairs:
+                self._v6_flush_events[store_event] = self._v6_flush_event_rec
             if store_req_ids:  # For eager mode only, track req->blocks mapping
                 self._store_event_to_reqs[store_event] = store_req_ids
                 for req_id in store_req_ids:
@@ -875,12 +1504,14 @@ class SimpleCPUOffloadScheduler:
         load_gpu: list[int] = []
         load_cpu: list[int] = []
         load_req_ids: list[str] = []
+        v6_load: list[tuple[int, int]] = []
         for req_id, load_state in self._reqs_to_load.items():
             if load_state.load_event is not None:
                 continue
             assert load_state.transfer_meta is not None
             load_gpu.extend(load_state.transfer_meta.gpu_block_ids)
             load_cpu.extend(load_state.transfer_meta.cpu_block_ids)
+            v6_load.extend(load_state.v6_pairs)
             load_req_ids.append(req_id)
         if load_req_ids:
             load_event = self._load_event_counter
@@ -901,7 +1532,15 @@ class SimpleCPUOffloadScheduler:
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
             need_flush=bool(scheduler_output.preempted_req_ids),
+            v6_store_pairs=list(v6_store_pairs),
+            v6_load_pairs=list(v6_load),
+            v6_flush_pairs=list(v6_flush_pairs),
         )
+        # v6 收件箱清空（本步已全部随 metadata 交给 worker）
+        self._v6_store_outbox = []
+        self._v6_store_event_rec = ([], [])
+        self._v6_flush_outbox = []
+        self._v6_flush_event_rec = []
         return result
 
     def _gate_family_hit(self, state: StoreRequestState, g: int, pos: int) -> bool:
@@ -943,6 +1582,8 @@ class SimpleCPUOffloadScheduler:
         gpu_block: "KVCacheBlock",
         preempted: bool,
         ledger_hit: bool = False,
+        bhash: "bytes | None" = None,
+        pos: int = -1,
     ) -> bool:
         """WriteGate v3：逐块写准入。返回 False = 暂缓（不写盘，下步重扫）。
 
@@ -965,6 +1606,10 @@ class SimpleCPUOffloadScheduler:
         - lifecycle：被抢占请求的块无条件写（恢复时省重算）。
         - auto：由 WriteGateController 的档位决定——relax 全写 / mid
           share∨ledger / strict 仅 ledger；lifecycle 保底不过控制器。
+        - hicache（基线）：该块**自身**历史读回数 >= hicache_min_hits 才写
+          （HiCache selective 口径；与 ledger 的区别是不查祖先家族）。
+        - trtprio（基线）：块在前缀中的位置 pos < trt_keep_head_blocks 才写
+          （TRT-LLM 静态头前缀优先保留的近似；bhash/pos 缺一按不命中处理）。
         """
         signals = self._write_gate_signals
         if not signals:
@@ -972,7 +1617,15 @@ class SimpleCPUOffloadScheduler:
         if "lifecycle" in signals and preempted:
             return True
         if "auto" in signals:
-            tier = self._gate_ctrl.tier if self._gate_ctrl else GATE_RELAX
+            ctrl = self._gate_ctrl
+            if ctrl is not None and ctrl.v4_enabled:
+                return ctrl.decide_auto(gpu_block, ledger_hit, bhash, pos)
+            if ctrl is not None and ctrl.v5_enabled:
+                # F1-lite 放在 v4 分派之后：v4 闭环有自己的通道登记，
+                # 不与 v4 混线（run4 臂的复现因此完全不受影响）。
+                if ctrl.grant_rewrite(bhash, ledger_hit):
+                    return True
+            tier = ctrl.tier if ctrl else GATE_RELAX
             if tier == GATE_RELAX:
                 return True
             if tier == GATE_MID:
@@ -982,7 +1635,12 @@ class SimpleCPUOffloadScheduler:
             return True
         if "ledger" in signals and ledger_hit:
             return True
-        if signals & {"share", "ledger"}:
+        if "trtprio" in signals and 0 <= pos < self._trt_keep_head_blocks:
+            return True
+        if "hicache" in signals and bhash is not None:
+            if profiler.hit_counts([bhash])[0] >= self._hicache_min_hits:
+                return True
+        if signals & {"share", "ledger", "hicache", "trtprio"}:
             return False
         return True
 
@@ -1157,7 +1815,9 @@ class SimpleCPUOffloadScheduler:
                     ledger_hit = (
                         self._gate_ledger and self._gate_family_hit(state, g, pos)
                     )
-                    if self._write_gate_should_store(blk, preempted, ledger_hit):
+                    if self._write_gate_should_store(
+                        blk, preempted, ledger_hit, blk.block_hash, pos
+                    ):
                         if seg_alloc is not None:
                             aff_key = f"g{bid // 32}"
                             cpu_blk = seg_alloc.take_block_affinity(aff_key)
@@ -1216,6 +1876,27 @@ class SimpleCPUOffloadScheduler:
                         advanced_per_group[g] += 1
                         continue
 
+                    # --- v6 defer：逐块 gate 旁路，块入 pending 池（不落盘）。
+                    # 落盘只经首读兑现（_v6_redeem 的 flush），INV1 构造成立。
+                    # 池满拒绝的丢弃计数走 pool.on_drop 回调（体积账统一口径）。
+                    if self._v6_pool is not None:
+                        _pool = self._v6_pool
+                        if _pool.contains(bhash_with_group):
+                            _pool.touch(bhash_with_group)
+                            advanced_per_group[g] += 1
+                            continue
+                        if _pool.admit(bhash_with_group):
+                            self._v6_store_outbox.append(
+                                (gpu_block_id, _pool.slot_of(bhash_with_group)))
+                            self._v6_store_event_rec[0].append(gpu_block_id)
+                            self._v6_store_event_rec[1].append(bhash_with_group)
+                            gpu_block_pool.touch([gpu_block])
+                            advanced_per_group[g] += 1
+                            continue
+                        # 池满丢无可丢 = 最终丢弃（重算兜底）
+                        advanced_per_group[g] += 1
+                        continue
+
                     # WriteGate v2/v3：逐块写准入。拒绝 = 暂缓入 per-request
                     # 重试队列（游标照常推进，位置 pos 一并入队供 ledger 祖先
                     # 查询）；每步扫描前重试 pending，兄弟请求 lookup 命中把
@@ -1225,7 +1906,8 @@ class SimpleCPUOffloadScheduler:
                         self._gate_ledger and self._gate_family_hit(state, g, pos)
                     )
                     if not self._write_gate_should_store(
-                        gpu_block, preempted, ledger_hit
+                        gpu_block, preempted, ledger_hit,
+                        bhash_with_group, pos,
                     ):
                         advanced_per_group[g] += 1
                         state.gate_pending.append((g, gpu_block_id, pos))
@@ -1292,12 +1974,16 @@ class SimpleCPUOffloadScheduler:
                 state.num_stored_blocks[g] += advanced_per_group[g]
             merged_dropped_blocks += n_dropped_req
 
-        if profiler.PROFILE and (merged_gpu_block_ids or merged_dropped_blocks):
+        if profiler.PROFILE and (
+            merged_gpu_block_ids or merged_dropped_blocks or self._v6_pool
+        ):
             # 体积账：写侧逐块决策（写盘 / WriteGate 拒绝）。
             profiler.note_store_decision(
                 len(merged_gpu_block_ids), merged_dropped_blocks,
                 merged_block_hashes,
             )
+            if self._v6_pool is not None:
+                profiler.note_v6_state(self._v6_pool.snapshot())
             if self._gate_ctrl is not None:
                 # 闭环反馈回路：把本步写盘块推入存活窗，成熟后回算在线死写率，
                 # 由死写率驱动准入档位；档位快照随 profiler 分片落盘。
@@ -1334,6 +2020,29 @@ class SimpleCPUOffloadScheduler:
 
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""
+        # --- v6：pending 入池 DMA 完成（settle）/ 兑现落盘完成（可发现） ---
+        v6_rec = self._v6_store_events.pop(event_idx, None)
+        if v6_rec is not None:
+            gpu_ids, admit_hashes = v6_rec
+            if self._v6_pool is not None:
+                self._v6_pool.settle(admit_hashes)
+            if gpu_ids:
+                assert self._gpu_block_pool is not None
+                self._gpu_block_pool.free_blocks(
+                    self._gpu_block_pool.blocks[bid] for bid in gpu_ids
+                )
+        v6_flush = self._v6_flush_events.pop(event_idx, None)
+        if v6_flush is not None:
+            for h, cpu_bid in v6_flush:
+                blk = self.cpu_block_pool.blocks[cpu_bid]
+                bhash = blk.block_hash
+                if bhash is not None:
+                    # 落盘数据就绪，hash 变为可发现（与原生 store 完成同式）
+                    self.cpu_block_pool.cached_block_hash_to_block.insert(
+                        bhash, blk)
+                if self._v6_pool is not None:
+                    self._v6_pool.unpin(h)  # 释放落盘保护 pin
+                self._free_cpu_blocks([blk])
         transfer = self._store_event_to_blocks.pop(event_idx, None)
         if transfer is None:
             transfer = self._abandoned_store_event_to_blocks.pop(event_idx, None)
@@ -1417,7 +2126,10 @@ class SimpleCPUOffloadScheduler:
     def has_pending_stores(self) -> bool:
         """Return True if there are in-flight store transfers."""
         return bool(
-            self._store_event_to_blocks or self._abandoned_store_event_to_blocks
+            self._store_event_to_blocks
+            or self._abandoned_store_event_to_blocks
+            or self._v6_store_events
+            or self._v6_flush_events
         )
 
     def request_finished(
@@ -1434,6 +2146,11 @@ class SimpleCPUOffloadScheduler:
         pending = self._pending_cpu_hits.pop(req_id, None)
         if pending is not None:
             self._free_pending_cpu_hit(pending)
+        # v6：未兑现的命中 pin 释放（请求取消/抢占路径）
+        v6_pin = self._v6_hit_pins.pop(req_id, None)
+        if v6_pin is not None and self._v6_pool is not None:
+            for h in v6_pin[0]:
+                self._v6_pool.unpin(h)
 
         # Handle load: defer cleanup if load is in-flight
         load_state = self._reqs_to_load.get(req_id)
@@ -1489,6 +2206,10 @@ class SimpleCPUOffloadScheduler:
             state = self._abandoned_reqs_to_load.pop(req_id, None)
         if state is None:
             return
+        # v6：load 完成（或废弃），pending 命中 pin 释放（槽位回归 LRU）
+        if state.pending_pins and self._v6_pool is not None:
+            for h in state.pending_pins:
+                self._v6_pool.unpin(h)
         # Remove from load event mapping (only this req, not whole event)
         if state.load_event is not None:
             reqs = self._load_event_to_reqs.get(state.load_event)

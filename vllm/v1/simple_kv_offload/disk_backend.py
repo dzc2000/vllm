@@ -124,6 +124,15 @@ class DiskBackend:
         self._tensor_names: list[str] = []
         # KVLog M3 阶段一：run 合并 I/O。>0 表示合并路径的每半缓冲 slot 数。
         self._coalesce_half: int = 0
+        # KVLog WriteGate v6（run6 defer）：pinned pending 池（0=关闭）。
+        # 槽位布局与暂存缓冲一致（交错张量视图），DMA 直入直出；
+        # 落盘仅经首读兑现（launch_v6_flush）。
+        self._defer_pending_slots: int = 0
+        self._pending_flat = None
+        self._pending_np = None
+        self._pending_buffer_caches = None
+        self._pending_store_params = None
+        self._pending_load_params = None
 
     def init(
         self,
@@ -138,6 +147,7 @@ class DiskBackend:
         use_page_cache: bool = False,
         coalesce_io: bool = True,
         segment_bytes: int = _DEFAULT_SEGMENT_BYTES,
+        defer_pending_bytes: int = 0,
     ) -> None:
         self._load_stream = load_stream
         self._store_stream = store_stream
@@ -234,6 +244,46 @@ class DiskBackend:
             src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
             copy_sizes=self._per_tensor_bpb,
         )
+        if defer_pending_bytes > 0:
+            # v6 pending 池：一块连续 pinned 内存，槽内布局与磁盘/暂存
+            # 缓冲一致（t0b0..tNb0, t0b1..tNb1, ...），DMA 与 pwritev 都
+            # 可直接按槽寻址。入池 = GPU->pending DMA；直供 = pending->GPU
+            # DMA；兑现落盘 = pending->盘 pwritev（无 GPU 参与）。
+            n_slots = max(1, defer_pending_bytes // total_block_bytes)
+            self._defer_pending_slots = n_slots
+            pflat = _alloc_aligned_flat(n_slots * total_block_bytes)
+            pin_tensor(pflat)
+            self._pending_flat = pflat
+            self._pending_np = pflat.numpy()
+            p_off = pflat.storage_offset()
+            self._pending_buffer_caches = {}
+            off2 = 0
+            for name, gpu_t in gpu_caches.items():
+                bpb = gpu_t.stride(0) * gpu_t.element_size()
+                self._pending_buffer_caches[name] = torch.as_strided(
+                    pflat, (n_slots, bpb), (total_block_bytes, 1),
+                    p_off + off2,
+                )
+                off2 += bpb
+            self._pending_store_params = build_params(
+                gpu_caches,
+                self._pending_buffer_caches,
+                store_stream,
+                src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
+                copy_sizes=self._per_tensor_bpb,
+            )
+            self._pending_load_params = build_params(
+                self._pending_buffer_caches,
+                gpu_caches,
+                load_stream,
+                src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+                copy_sizes=self._per_tensor_bpb,
+            )
+            logger.info(
+                "DiskBackend v6 defer pending pool: %d slots (%.2f GiB)",
+                n_slots,
+                (n_slots * total_block_bytes) / (1024**3),
+            )
 
         os.makedirs(os.path.dirname(disk_path) or ".", exist_ok=True)
         # Slot contents never outlive the process, so unlink then O_EXCL rather
@@ -274,6 +324,53 @@ class DiskBackend:
         )
         self._store_thread.start()
         self._load_thread.start()
+
+    def launch_v6_store(
+        self,
+        gpu_blocks: list[int],
+        pending_slots: list[int],
+        event_idx: int,
+        events_list: list[tuple[int, torch.Event]],
+        wait_event: "torch.Event | None" = None,
+    ) -> None:
+        """v6 入池：GPU -> pinned pending（纯 DMA，不落盘）。"""
+        if self._defer_pending_slots <= 0:
+            logger.error(
+                "v6 pending store 入队但池未启用（%d 块被丢弃）", len(gpu_blocks))
+            return
+        self._store_queue.put(
+            ("v6_store", gpu_blocks, pending_slots, event_idx, events_list,
+             wait_event))
+
+    def launch_v6_load(
+        self,
+        pending_slots: list[int],
+        gpu_blocks: list[int],
+        event_idx: int,
+        events_list: list[tuple[int, torch.Event]],
+    ) -> None:
+        """v6 直供：pinned pending -> GPU（免盘读）。"""
+        if self._defer_pending_slots <= 0:
+            logger.error(
+                "v6 pending load 入队但池未启用（%d 块被丢弃）", len(gpu_blocks))
+            return
+        self._load_queue.put(
+            ("v6_load", pending_slots, gpu_blocks, event_idx, events_list, None))
+
+    def launch_v6_flush(
+        self,
+        pending_slots: list[int],
+        disk_slots: list[int],
+        event_idx: int,
+        events_list: list[tuple[int, torch.Event]],
+    ) -> None:
+        """v6 兑现落盘：pinned pending -> 盘（pwritev，无 GPU 参与）。"""
+        if self._defer_pending_slots <= 0:
+            logger.error(
+                "v6 flush 入队但池未启用（%d 块被丢弃）", len(pending_slots))
+            return
+        self._store_queue.put(
+            ("v6_flush", pending_slots, disk_slots, event_idx, events_list, None))
 
     def launch_copy(
         self,
@@ -361,6 +458,33 @@ class DiskBackend:
                 # 均已注册，set 放行等待中的 flush。
                 item.set()
                 continue
+            if isinstance(item, tuple) and item and isinstance(item[0], str):
+                # v6 分派：入池 DMA（等 compute_done）与兑现落盘（纯 pwritev）
+                try:
+                    if item[0] == "v6_store":
+                        _, gpus, pslots, event_idx, events_list, wait_event = item
+                        if wait_event is not None:
+                            stream.wait_event(wait_event)
+                            if profiler.PROFILE:
+                                _ts = profiler.now()
+                            wait_event.synchronize()
+                            if profiler.PROFILE:
+                                profiler.note_dep_wait(
+                                    "store", profiler.now() - _ts)
+                        self._do_v6_store(gpus, pslots, stream)
+                    else:
+                        _, pslots, dslots, event_idx, events_list, _ = item
+                        self._do_v6_flush(pslots, dslots)
+                except Exception:
+                    logger.exception(
+                        "DiskBackend v6 store thread exiting: %d blocks lost",
+                        len(item[1]),
+                    )
+                    return
+                event = torch.Event()
+                event.record(stream)
+                events_list.append((event_idx, event))
+                continue
             (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
             try:
                 if wait_event is not None:
@@ -441,6 +565,63 @@ class DiskBackend:
         if profiler.PROFILE:
             profiler.note_syscalls("load", bytes_read)
 
+    def _do_v6_store(
+        self,
+        gpu_blocks: list[int],
+        pending_slots: list[int],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """v6 入池 DMA：GPU -> pinned pending（逐块描述符，无盘 I/O）。"""
+        assert self._pending_store_params is not None
+        copy_blocks(
+            gpu_blocks, pending_slots, self._pending_store_params,
+            coalesce=False,
+        )
+        if profiler.PROFILE:
+            profiler.note_batch(
+                "store", len(gpu_blocks), 0.0, 0.0, 0.0, 0.0)
+
+    def _do_v6_load(
+        self,
+        pending_slots: list[int],
+        gpu_blocks: list[int],
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """v6 直供 DMA：pinned pending -> GPU（免盘读）。"""
+        assert self._pending_load_params is not None
+        copy_blocks(
+            pending_slots, gpu_blocks, self._pending_load_params,
+            coalesce=False,
+        )
+        if profiler.PROFILE:
+            profiler.note_batch(
+                "load", len(gpu_blocks), 0.0, 0.0, 0.0, 0.0)
+
+    def _do_v6_flush(
+        self,
+        pending_slots: list[int],
+        disk_slots: list[int],
+    ) -> None:
+        """v6 兑现落盘：pending -> 盘（逐槽 pwritev，无 GPU 参与）。
+
+        兑现量 = 被读过的块（首读触发），远小于全写量，逐槽写不构成
+        瓶颈；盘偏移按 slot 对齐（O_DIRECT 对齐约束与 _writev_slot 同）。
+        """
+        ttb = self._total_block_bytes
+        t0 = profiler.now() if profiler.PROFILE else 0.0
+        for ps, ds in zip(pending_slots, disk_slots):
+            view = memoryview(self._pending_np[ps * ttb : (ps + 1) * ttb])
+            written = os.pwritev(self._fd, [view], ds * ttb)
+            if written < ttb:
+                raise OSError(
+                    f"v6 flush short write: {written}/{ttb} bytes")
+            if profiler.PROFILE:
+                profiler.note_syscalls("store", written)
+        if profiler.PROFILE:
+            profiler.note_batch(
+                "store", len(pending_slots), profiler.now() - t0,
+                profiler.now() - t0, 0.0, 0.0)
+
     def _load_loop(
         self,
         device: torch.device,
@@ -451,6 +632,21 @@ class DiskBackend:
             item = self._load_queue.get()
             if item is None:
                 return
+            if isinstance(item, tuple) and item and isinstance(item[0], str):
+                # v6 直供 load：pinned pending -> GPU（免盘读）
+                try:
+                    _, pslots, gpus, event_idx, events_list, _ = item
+                    self._do_v6_load(pslots, gpus, stream)
+                except Exception:
+                    logger.exception(
+                        "DiskBackend v6 load thread exiting: %d blocks lost",
+                        len(item[2]),
+                    )
+                    return
+                event = torch.Event()
+                event.record(stream)
+                events_list.append((event_idx, event))
+                continue
             (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
             try:
                 if wait_event is not None:

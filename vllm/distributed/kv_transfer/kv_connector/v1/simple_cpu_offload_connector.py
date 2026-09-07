@@ -123,6 +123,16 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # 空 = 关闭，原生全写基线）。经 extra_config 传递（环境变量在
         # EngineCore 子进程中不可靠）。
         write_gate_signals = str(extra_config.get("write_gate_signals", ""))
+        # KVLog 语义基线参数：hicache_min_hits（HiCache selective 阈值）与
+        # trt_keep_head_blocks（TRT 静态头前缀窗），仅对应信号启用时被读取。
+        hicache_min_hits = int(extra_config.get("hicache_min_hits", 1))
+        trt_keep_head_blocks = int(extra_config.get("trt_keep_head_blocks", 0))
+        # KVLog WriteGate v6（run6 defer）：延迟写 + 首读兑现的 pending 池
+        # 容量（GiB，0=关闭）。仅 disk+eager 模式生效；与 v3/v4/v5 信号
+        # 正交——激活后 eager 扫描的块改入 pending 池，落盘只经首读兑现
+        # （INV1：落盘块必有 >=1 次读，dead_blocks 恒 0 可核验）。
+        defer_pending_gib = float(extra_config.get("defer_pending_gib", 0.0))
+        defer_pending_bytes = int(defer_pending_gib * (1024**3))
 
         # KVLog profiling：环境变量在 EngineCore 子进程中不可靠，
         # 经 extra_config（随 VllmConfig 序列化传递）激活是可靠路径。
@@ -167,7 +177,8 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         logger.info(
             "SimpleCPUOffloadConnector: role=%s, "
             "per_rank=%.2f GB, world_size=%d, mode=%s, backend=%s, disk=%s, "
-            "lag_store_steps=%d, write_gate=%r",
+            "lag_store_steps=%d, write_gate=%r, "
+            "hicache_min_hits=%d, trt_keep_head_blocks=%d",
             role.name,
             cpu_capacity_per_rank / (1024**3),
             world_size,
@@ -176,6 +187,8 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             disk_path or "none",
             lag_store_steps,
             write_gate_signals,
+            hicache_min_hits,
+            trt_keep_head_blocks,
         )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -194,6 +207,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 lazy_offload=lazy_offload,
                 disk_capacity_bytes=disk_capacity_bytes if disk_mode else 0,
                 write_gate_signals=write_gate_signals,
+                hicache_min_hits=hicache_min_hits,
+                trt_keep_head_blocks=trt_keep_head_blocks,
+                defer_pending_bytes=defer_pending_bytes,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
@@ -208,6 +224,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 disk_coalesce_io=disk_coalesce_io,
                 disk_segment_bytes=disk_segment_bytes,
                 lag_store_steps=lag_store_steps,
+                defer_pending_bytes=defer_pending_bytes,
             )
 
     # --- Worker-side methods ---

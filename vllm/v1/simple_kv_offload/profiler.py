@@ -168,6 +168,21 @@ def note_gate_state(state: dict) -> None:
         _gate.update(state)
 
 
+# WriteGate v6（run6 defer）：延迟写池观测（manager 侧覆盖写，随分片
+# 落盘）。判卷护栏 G2（pending_peak<=cap）/ G3（dropped_then_requested）
+# 与分列字段 pending_hits 都从这里出。
+_v6: dict = {}
+
+
+def note_v6_state(state: dict) -> None:
+    """WriteGate v6 延迟写池快照（覆盖写，随分片 dump）。"""
+    if not PROFILE:
+        return
+    with _lock:
+        _v6.clear()
+        _v6.update(state)
+
+
 def note_batch(direction: str, blocks: int, wall: float,
                io: float, sync: float, dma: float) -> None:
     if not PROFILE:
@@ -299,6 +314,7 @@ def _dump() -> None:
                     "io": {k: dict(v) for k, v in _io_stats.items()},
                     "volume": _volume_summary(),
                     "gate": dict(_gate),
+                    "v6": dict(_v6),
                     "runs": {
                         k: {
                             "runs_hist": dict(v["runs_hist"]),
