@@ -133,6 +133,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # （INV1：落盘块必有 >=1 次读，dead_blocks 恒 0 可核验）。
         defer_pending_gib = float(extra_config.get("defer_pending_gib", 0.0))
         defer_pending_bytes = int(defer_pending_gib * (1024**3))
+        # KVLog S4b（§16）WB 消融：defer 池逐出未 flush 块时先写回落盘
+        # 而非丢弃。仅与 defer_pending_gib>0 连用；False 默认 = v6 原生
+        # drop 语义（逐字节不变）。
+        evict_writeback = bool(extra_config.get("evict_writeback", False))
 
         # KVLog profiling：环境变量在 EngineCore 子进程中不可靠，
         # 经 extra_config（随 VllmConfig 序列化传递）激活是可靠路径。
@@ -210,6 +214,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 hicache_min_hits=hicache_min_hits,
                 trt_keep_head_blocks=trt_keep_head_blocks,
                 defer_pending_bytes=defer_pending_bytes,
+                evict_writeback=evict_writeback,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(

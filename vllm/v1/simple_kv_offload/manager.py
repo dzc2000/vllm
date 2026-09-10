@@ -74,9 +74,16 @@ class _DeferPendingPool:
     体积账 dropped_blocks，unique-hash 去重）；丢无可丢（全 pinned/
     inflight）时拒绝新入池 = 最终丢弃。丢弃后的 hash 被重算（= 需求
     证据）可再次入池（二次机会，不重复计数）。
+
+    S4b（§16）逐出写回：传入 on_evict_wb 后"未 flush 逐出"改走"先写回
+    再让容量"——回调返回 True（已入队盘侧）时槽位被 pwritev 占用不可
+    交还，本轮不产出空槽（admit 拒绝新 hash，RAM 驻留仍 <= cap，W1 等
+    容量构造性成立）；flush 完成 hook 退针后该条目经"已 flush"路径无损
+    让出容量。回调返回 False（盘池满）落回原 drop 路径。
+    None = v6 原生 drop 语义（逐字节不变）。
     """
 
-    def __init__(self, cap_slots: int, on_drop=None) -> None:
+    def __init__(self, cap_slots: int, on_drop=None, on_evict_wb=None) -> None:
         self.cap = max(0, int(cap_slots))
         self._slot: dict[bytes, int] = {}  # hash -> pending 槽位
         self._lru: dict[bytes, None] = {}  # 插入序即 LRU 序（touch 重插）
@@ -86,11 +93,14 @@ class _DeferPendingPool:
         self.flushed: set[bytes] = set()
         self.dropped: set[bytes] = set()
         self._on_drop = on_drop
+        # S4b WB 逐出写回回调 (hash, pslot) -> bool，False = 写不回走原 drop
+        self._on_evict_wb = on_evict_wb
         # 计数器（判卷护栏与分列字段的原始数据）
         self.admits = 0
         self.hits = 0
         self.drops = 0
         self.flushes = 0
+        self.wb_flushes = 0  # flushes 中由逐出写回贡献的子集
         self.dropped_then_requested = 0
         self.peak = 0
 
@@ -113,6 +123,14 @@ class _DeferPendingPool:
         for h in self._lru:  # dict 序 = LRU 序，从最老开始
             if self.pinned.get(h, 0) > 0 or h in self.inflight:
                 continue
+            if h not in self.flushed and self._on_evict_wb is not None:
+                # S4b WB：未落盘块先写回（回调置 flushed + pin_protect +
+                # 盘侧排队）。成功时槽位被 pwritev 占用不可交还——本轮
+                # 不产出空槽，返回 False 即 admit 拒绝新 hash；flush 完成
+                # hook unpin 后，该条目经下方"已 flush"路径正常让出容量。
+                if self._on_evict_wb(h, self._slot[h]):
+                    return False
+                # 盘池满：写回失败，落回原 drop 路径（v6 语义兜底）
             slot = self._slot.pop(h)
             del self._lru[h]
             self._free.append(slot)
@@ -184,6 +202,7 @@ class _DeferPendingPool:
             "pending_hits": self.hits,
             "drops": self.drops,
             "flushes": self.flushes,
+            "wb_flushes": self.wb_flushes,
             "dropped_set": len(self.dropped),
             "dropped_then_requested": self.dropped_then_requested,
             "pending_peak": self.peak,
@@ -827,6 +846,7 @@ class SimpleCPUOffloadScheduler:
         hicache_min_hits: int = 1,
         trt_keep_head_blocks: int = 0,
         defer_pending_bytes: int = 0,
+        evict_writeback: bool = False,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -931,11 +951,19 @@ class SimpleCPUOffloadScheduler:
                     slots,
                     on_drop=(lambda h: profiler.note_store_decision(0, 1, []))
                     if profiler.PROFILE else None,
+                    on_evict_wb=(self._v6_evict_writeback
+                                 if evict_writeback else None),
                 )
                 logger.info(
                     "SimpleCPUOffloadScheduler: WriteGate v6 defer 池 %d 槽"
-                    "（%.2f GiB，block=%d B）—— 落盘仅经首读兑现（INV1）",
-                    slots, defer_pending_bytes / (1024**3), block_bytes)
+                    "（%.2f GiB，block=%d B，evict=%s）—— "
+                    "落盘仅经首读兑现（INV1）",
+                    slots, defer_pending_bytes / (1024**3), block_bytes,
+                    "WB" if evict_writeback else "drop")
+        elif evict_writeback:
+            logger.warning(
+                "WriteGate v6 evict_writeback 需要 defer 池"
+                "（defer_pending_bytes>0），已忽略")
         # WriteGate v3：ledger（历史复用账本）与 auto（闭环控制器）都以
         # profiler 的读回命中表为唯一数据源。profiler 未开时该表恒空，
         # "无数据"会被误判成"无命中"而把写全部拒掉，故此处显式降级并告警。
@@ -1472,6 +1500,37 @@ class SimpleCPUOffloadScheduler:
             v6_pairs=load_pairs,
             pending_pins=list(hashes),
         )
+
+    def _v6_evict_writeback(self, h: bytes, pslot: int) -> bool:
+        """S4b（§16）逐出写回：LRU 淘汰的未读块先落盘而非丢弃。
+
+        复用 redeem 的盘侧入队式（无 GPU 参与）：seg_alloc 优先（"wb"
+        亲和键，无历史亲和即回落全局段推进），无盘段分配器时走
+        cpu_block_pool。成功后条目转 flushed 且驻留 RAM，仍可命中直读；
+        同时计 flushes 与 wb_flushes（后者为 W2/W4 判据口径）。该 hash
+        若日后被读回则非死写，never-read = 死写，正是 S4b 要测的量。
+        盘池满返回 False，调用方落回 v6 drop 语义。
+        """
+        pool = self._v6_pool
+        assert pool is not None
+        seg_alloc = self._disk_seg_alloc
+        cpu_blk = None
+        if seg_alloc is not None:
+            cpu_blk = seg_alloc.take_block_affinity("wb")
+        elif self.cpu_block_pool.get_num_free_blocks() > 0:
+            cpu_blk = self.cpu_block_pool.get_new_blocks(1)[0]
+        if cpu_blk is None:
+            return False  # 盘池满：写不回，drop 兜底
+        cpu_blk._block_hash = h  # type: ignore[assignment]
+        pool.mark_flushed(h)
+        pool.pin_protect(h)  # pwritev 完成前 LRU 不可逐出该槽
+        pool.flushes += 1
+        pool.wb_flushes += 1
+        self._v6_flush_outbox.append((pslot, cpu_blk.block_id))
+        self._v6_flush_event_rec.append((h, cpu_blk.block_id))
+        if profiler.PROFILE:
+            profiler.note_store_decision(1, 0, [h])
+        return True
 
     def build_connector_meta(
         self,
