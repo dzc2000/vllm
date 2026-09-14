@@ -481,27 +481,40 @@ class SimpleCPUOffloadWorker:
         self._flush_and_sync_all()
 
     def _flush_and_sync_all(self) -> None:
-        """Synchronize all in-flight transfer events."""
+        """Synchronize all in-flight transfer events.
+
+        KVLog §26.6.1：把抢占 flush 的阻塞拆成三段（barrier / load_sync /
+        store_sync）分别计时，用于判定 C1（抢占 flush 是否 engine 的阻塞点）。
+        计时只在 KVLOG_PROFILE=1 时进行，控制流逐字节不变。
+        """
+        profiling = profiler.PROFILE
+        t_barrier = 0.0
         # 滞后 store：先把持有批提交出去再同步——抢占后块可能被复用，
         # 持有批的 DMA 必须在 flush 返回前完成，否则读到复用后的数据。
         if self._lagged_batches and self._backend is not None:
             self._submit_lagged(self._backend)
             # launch_copy 只入队，done 事件要等 store 线程处理到该队列项
             # 之后才注册；不先过队列屏障，下面的事件同步覆盖不到持有批。
+            t0 = profiler.now() if profiling else 0.0
             self._backend.store_barrier()
-        # KVLog profiling：抢占 flush 是 engine 的真实阻塞点
-        t0 = profiler.now() if profiler.PROFILE else 0.0
+            if profiling:
+                t_barrier = profiler.now() - t0
+        # 旧实现从 barrier 之后才起算 => barrier 段此前完全未计时（本节补上）
+        t0 = profiler.now() if profiling else 0.0
         for event_idx, event in self._load_events:
             event.synchronize()
             self._load_hwm = event_idx
         self._load_events.clear()
+        t_load = (profiler.now() - t0) if profiling else 0.0
 
+        t0 = profiler.now() if profiling else 0.0
         for event_idx, event in self._store_events:
             event.synchronize()
             self._store_hwm = event_idx
         self._store_events.clear()
-        if profiler.PROFILE:
-            profiler.note_flush(profiler.now() - t0)
+        if profiling:
+            t_store = profiler.now() - t0
+            profiler.note_flush(t_barrier, t_load, t_store)
 
     def _poll_stream_events(self, is_store: bool) -> int:
         """Non-blocking poll for completed events and return the high-water mark."""

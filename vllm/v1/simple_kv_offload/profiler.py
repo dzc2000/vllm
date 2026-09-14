@@ -80,7 +80,13 @@ def _bucket(length: int) -> int:
 _MAX_SERIES = 200_000
 _load_events: list[list[float]] = []  # [submit_ts, done_ts]
 _pending_series: list[list[float]] = []  # [ts, pending_load_events]
-_flush_stats = {"count": 0, "wall_s": 0.0}
+_flush_stats = {
+    "count": 0,
+    "wall_s": 0.0,       # 旧语义 = load_sync_s + store_sync_s（不含 barrier）
+    "barrier_s": 0.0,    # §26.6.1 新增：store_barrier() 等待（旧实现完全未计时）
+    "load_sync_s": 0.0,
+    "store_sync_s": 0.0,
+}
 
 # 等待上游依赖事件（如 compute_done）的主机侧墙钟累计：把 sync_wall 拆成
 # 依赖等待（调度节拍税）与 DMA 本体等待，供论文 store 侧分解引用。
@@ -93,6 +99,68 @@ _dep_wait: dict[str, float] = {"store": 0.0, "load": 0.0}
 # 键域 <= 盘池容量（每哈希最多一条），长跑安全；读回侧聚合为直方图输出。
 _volume = {"stored_blocks": 0, "dropped_blocks": 0}
 _block_hits: dict[bytes, int] = {}
+
+# R 批（§18）仪器：被重算的 prompt token 数 vs prompt token 总数。
+# recomputed_tokens = Σ_请求 prefill_stats.num_computed_tokens（首次调度时
+# 前缀未命中、必须本地重算的 token 数）；prompt_tokens = Σ num_prompt_tokens。
+# 二者之比即"重算代价占比"，用作写/算联合准入的干净代价轴（替代脏代理 drops）。
+# 默认关闭时 note_recompute 为空操作。
+_recompute = {
+    "counted_requests": 0,
+    "first_prefill_events": 0,
+    "prompt_tokens": 0,
+    "recomputed_tokens": 0,
+    "reprefill_events": 0,
+    "reprefill_recomputed_tokens": 0,
+}
+# 按 request_id 去重：每请求只计一次（首次 prefill）=> 分母臂不变。
+# 见 note_recompute 的 v2 说明。
+_recompute_seen: set[str] = set()
+
+# R 批控制器轨迹（wrc 臂覆盖写，随分片 dump）。
+_wrc: dict = {}
+
+
+def note_recompute(req_id: str, n_recomputed: int, n_prompt: int) -> None:
+    """R 批（v2）：逐请求记账"必须本地重算的 prompt token 数"与 prompt 总数。
+
+    v2 修复：v1 挂在 `num_preemptions<=0` 门控 + 单一调度分支内，首次实跑
+    发现各臂 `prompt_tokens` 不一致（ref 2,678,826 vs 池臂 ≈1.52M，−43%）
+    ——同一份 trace 的分母随臂漂移，跨臂比较被污染。v2 改为**按 request_id
+    去重**：每请求只在首次 prefill 计一次，与走哪个分支、是否被抢占无关
+    ⇒ `prompt_tokens = Σ 全量请求 num_prompt_tokens`，**构造性臂不变**
+    （可用 `counted_requests == num_requests` 自证）。
+    被抢占后的重算 prefill 单独计入 `reprefill_*`，**不并入 R**（与 v1 语义一致）。
+    """
+    if not PROFILE:
+        return
+    with _lock:
+        if req_id not in _recompute_seen:
+            _recompute_seen.add(req_id)
+            _recompute["counted_requests"] += 1
+            _recompute["first_prefill_events"] += 1
+            _recompute["prompt_tokens"] += max(0, int(n_prompt))
+            _recompute["recomputed_tokens"] += max(0, int(n_recomputed))
+        else:
+            _recompute["reprefill_events"] += 1
+            _recompute["reprefill_recomputed_tokens"] += max(
+                0, int(n_recomputed)
+            )
+
+
+def recompute_totals() -> dict:
+    """R 批：累计 (recomputed_tokens, prompt_tokens) 只读快照。"""
+    with _lock:
+        return dict(_recompute)
+
+
+def note_wrc_state(state: dict) -> None:
+    """R 批控制器（wrc 臂）快照（覆盖写，随分片 dump）。"""
+    if not PROFILE:
+        return
+    with _lock:
+        _wrc.clear()
+        _wrc.update(state)
 
 # WriteGate v3 闭环回路：控制器把在线死写率与档位轨迹写回这里，随分片
 # 一起落盘（gate 决策发生在 EngineCore 进程，与 _block_hits 同进程同账本）。
@@ -183,6 +251,20 @@ def note_v6_state(state: dict) -> None:
         _v6.update(state)
 
 
+# D 批（§19）诊断快照（manager 的 diag_tick 覆盖写）。
+# 【C1 临时补齐】原树由 patch_wrc_diag.py 注入，上传覆盖后丢失；此处按
+# DP1 的最小等价物补回，使 diag_tick 不再 AttributeError。
+_diag: dict = {}
+
+def note_diag_state(state: dict) -> None:
+    """D 批（§19）诊断快照（覆盖写，随分片 dump）。"""
+    if not PROFILE:
+        return
+    with _lock:
+        _diag.clear()
+        _diag.update(state)
+
+
 def note_batch(direction: str, blocks: int, wall: float,
                io: float, sync: float, dma: float) -> None:
     if not PROFILE:
@@ -241,12 +323,26 @@ def note_pending(n_pending: int) -> None:
             _pending_series.append([now(), n_pending])
 
 
-def note_flush(wall: float) -> None:
+def note_flush(barrier_s: float = 0.0, load_sync_s: float = 0.0,
+               store_sync_s: float = 0.0) -> None:
+    """抢占 flush 阻塞分解（§26.6.1）。
+
+    barrier_s     : store_barrier() 等待（关"入队但未注册"窗口；覆盖 store
+                    线程的队列排空，其中含实际 pwritev。要与 pwritev 本体
+                    分离需另测 store 线程，store 方向 io_wall_s 已记）。
+    load_sync_s   : load event.synchronize() 等待（在途 load DMA）。
+    store_sync_s  : store event.synchronize() 等待（在途 store DMA）。
+    wall_s 保持旧语义 = load_sync_s + store_sync_s，便于与历史 dump 对照
+    （旧实现的计时从 barrier 之后起算，barrier 段完全未计）。
+    """
     if not PROFILE:
         return
     with _lock:
         _flush_stats["count"] += 1
-        _flush_stats["wall_s"] += wall
+        _flush_stats["barrier_s"] += barrier_s
+        _flush_stats["load_sync_s"] += load_sync_s
+        _flush_stats["store_sync_s"] += store_sync_s
+        _flush_stats["wall_s"] += load_sync_s + store_sync_s
 
 
 _activated_pid: int | None = None
@@ -315,6 +411,7 @@ def _dump() -> None:
                     "volume": _volume_summary(),
                     "gate": dict(_gate),
                     "v6": dict(_v6),
+                    "diag": dict(_diag),
                     "runs": {
                         k: {
                             "runs_hist": dict(v["runs_hist"]),
@@ -327,6 +424,8 @@ def _dump() -> None:
                         for k, v in _run_stats.items()
                     },
                     "dep_wait": dict(_dep_wait),
+                    "recompute": dict(_recompute),
+                    "wrc": dict(_wrc),
                     "load_events": _load_events[:_MAX_SERIES],
                     "pending_series": _pending_series[:_MAX_SERIES],
                     "flush": dict(_flush_stats),

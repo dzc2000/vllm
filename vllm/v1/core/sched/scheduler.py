@@ -934,6 +934,19 @@ class Scheduler(SchedulerInterface):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                # R 批仪器 v2（§18）：本条 prefill 调度的重算量 = 未命中本地/
+                # 外部前缀缓存、必须本地重算的 prompt token 数。挂钩放在
+                # `num_computed_tokens == 0` 与 else **汇合之后**，故无论走哪个
+                # 分支、是否被抢占都会到达；request_id 去重 => 每请求只计一次
+                # => 分母（prompt_tokens）臂不变。PROFILE 关闭时空操作。
+                from vllm.v1.simple_kv_offload import profiler as _kvlog_prof
+
+                _kvlog_prof.note_recompute(
+                    request.request_id,
+                    request.num_prompt_tokens - num_computed_tokens,
+                    request.num_prompt_tokens,
+                )
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget

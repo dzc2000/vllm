@@ -137,6 +137,14 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         # 而非丢弃。仅与 defer_pending_gib>0 连用；False 默认 = v6 原生
         # drop 语义（逐字节不变）。
         evict_writeback = bool(extra_config.get("evict_writeback", False))
+        # A 批（写准入对比）：池内读次数阈值 θ（1=现状「首读即落盘」）
+        # 与 LRU-K 写准入 K（0=关；>0 用跨驱逐存活的历史计数）
+        defer_min_reads = max(1, int(extra_config.get("defer_min_reads", 1)))
+        kvadmit_lru_k = max(0, int(extra_config.get("kvadmit_lru_k", 0)))
+        # P 批（§23）：池内逐出选择键（0=关；1=LRU+记账；2=逐出最深；3=逐出最浅）
+        possel = int(extra_config.get("possel", 0))
+        # R 批（§18）：写/算联合准入预算 ρ*（recomputed/prompt <= ρ*；0=关）
+        wrc_rho = max(0.0, float(extra_config.get("wrc_rho", 0.0)))
 
         # KVLog profiling：环境变量在 EngineCore 子进程中不可靠，
         # 经 extra_config（随 VllmConfig 序列化传递）激活是可靠路径。
@@ -215,6 +223,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 trt_keep_head_blocks=trt_keep_head_blocks,
                 defer_pending_bytes=defer_pending_bytes,
                 evict_writeback=evict_writeback,
+                defer_min_reads=defer_min_reads,
+                kvadmit_lru_k=kvadmit_lru_k,
+                possel=possel,
+                wrc_rho=wrc_rho,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(

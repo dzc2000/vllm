@@ -83,8 +83,23 @@ class _DeferPendingPool:
     None = v6 原生 drop 语义（逐字节不变）。
     """
 
-    def __init__(self, cap_slots: int, on_drop=None, on_evict_wb=None) -> None:
+    def __init__(self, cap_slots: int, on_drop=None, on_evict_wb=None,
+                 min_reads: int = 1, reads_survive_drop: bool = False,
+                 possel: int = 0) -> None:
         self.cap = max(0, int(cap_slots))
+        # P 批（§23）：逐出选择键。0=关（逐字节等价 v6）；1=LRU+深度记账；
+        # 2=逐出最深；3=逐出最浅（方向对照）。分桶 = pos//4，封顶 15。
+        self.possel = int(possel)
+        self._pos_of: dict[bytes, int] = {}  # hash -> 前缀深度（块序号）
+        self._admits_by_b = [0] * 16
+        self._hits_by_b = [0] * 16
+        self._drops_by_b = [0] * 16
+        self.possel_evictions = 0
+        # A 批：落盘门槛。min_reads=1 且 survive=False => 与 v6 现状逐字节等价
+        self.min_reads = max(1, int(min_reads))
+        self._reads_survive = bool(reads_survive_drop)
+        self._reads: dict[bytes, int] = {}  # hash -> 命中（读）次数
+        self.evict_flushed = 0  # D 批：被逐出时"已落盘"的条目数（逐出构成）
         self._slot: dict[bytes, int] = {}  # hash -> pending 槽位
         self._lru: dict[bytes, None] = {}  # 插入序即 LRU 序（touch 重插）
         self._free: list[int] = list(range(self.cap))[::-1]
@@ -112,7 +127,21 @@ class _DeferPendingPool:
             del self._lru[h]
             self._lru[h] = None  # 重插到尾 = MRU
 
+    def _pb(self, pos: int) -> int:
+        """前缀深度（块序号）-> 桶号：4 块/桶，越深越大，封顶 15。"""
+        b = int(pos) // 4
+        return 0 if b < 0 else (15 if b > 15 else b)
+
     def _drop(self, h: bytes) -> None:
+        # P 批 v2（修正）：桶内死率按「唯一 hash 首次丢弃」计（与 ledger 的
+        # drops 同口径）。v1 记的是**丢弃事件**——块被丢→重入池→再丢会计两次，
+        # 浅桶（重入池多）被系统性高估。此修正不改任何策略路径。
+        _p = self._pos_of.pop(h, None) if self.possel else None
+        _first = h not in self.dropped
+        if _p is not None and _first:
+            self._drops_by_b[self._pb(_p)] += 1
+        if not self._reads_survive:
+            self._reads.pop(h, None)  # θ 模式：计数随驻留消失（LRU-K 保留）
         if h not in self.dropped:
             self.dropped.add(h)
             self.drops += 1
@@ -120,28 +149,51 @@ class _DeferPendingPool:
                 self._on_drop(h)
 
     def _evict_one(self) -> bool:
+        # P 批（§23）：先按选择键挑受害者，再走原让出路径。possel=0/1 时选择键
+        # 仍是"LRU 最老"，与原实现逐字节等价；2/3 改按前缀深度挑。
+        victim = None
+        best = -1
         for h in self._lru:  # dict 序 = LRU 序，从最老开始
             if self.pinned.get(h, 0) > 0 or h in self.inflight:
                 continue
-            if h not in self.flushed and self._on_evict_wb is not None:
-                # S4b WB：未落盘块先写回（回调置 flushed + pin_protect +
-                # 盘侧排队）。成功时槽位被 pwritev 占用不可交还——本轮
-                # 不产出空槽，返回 False 即 admit 拒绝新 hash；flush 完成
-                # hook unpin 后，该条目经下方"已 flush"路径正常让出容量。
-                if self._on_evict_wb(h, self._slot[h]):
-                    return False
-                # 盘池满：写回失败，落回原 drop 路径（v6 语义兜底）
-            slot = self._slot.pop(h)
-            del self._lru[h]
-            self._free.append(slot)
-            if h not in self.flushed:
-                self._drop(h)  # 未 flush：数据消失，重算兜底
-            # 已 flush：盘上有副本，逐出无损（hash 仍可从 CPU 池发现）
-            return True
-        return False  # 全被 pin/inflight：丢无可丢
+            if self.possel in (2, 3):
+                _p = self._pos_of.get(h, -1)
+                if victim is None or (
+                    (self.possel == 2 and _p > best)
+                    or (self.possel == 3 and _p < best)
+                ):
+                    victim, best = h, _p
+                continue
+            victim = h
+            break
+        if victim is None:
+            return False  # 全被 pin/inflight：丢无可丢
+        h = victim
+        self.possel_evictions += 1
+        if h not in self.flushed and self._on_evict_wb is not None:
+            # S4b WB：未落盘块先写回（回调置 flushed + pin_protect +
+            # 盘侧排队）。成功时槽位被 pwritev 占用不可交还——本轮
+            # 不产出空槽，返回 False 即 admit 拒绝新 hash；flush 完成
+            # hook unpin 后，该条目经下方"已 flush"路径正常让出容量。
+            if self._on_evict_wb(h, self._slot[h]):
+                return False
+            # 盘池满：写回失败，落回原 drop 路径（v6 语义兜底）
+        slot = self._slot.pop(h)
+        del self._lru[h]
+        self._free.append(slot)
+        if h not in self.flushed:
+            self._drop(h)  # 未 flush：数据消失，重算兜底
+        else:
+            self.evict_flushed += 1  # D 批：已落盘逐出（盘上有副本，无损）
+        # 已 flush：盘上有副本，逐出无损（hash 仍可从 CPU 池发现）
+        return True
 
-    def admit(self, h: bytes) -> bool:
-        """块入池（inflight 态）。满时先 LRU 丢最老未读；丢无可丢则拒绝。"""
+    def admit(self, h: bytes, pos: int = -1) -> bool:
+        """块入池（inflight 态）。满时先按选择键丢一块；丢无可丢则拒绝。
+
+        P 批（§23）：`pos` = 该块在请求前缀内的块序号（越深越大）。仅当
+        possel!=0 时记录，供逐出选择与深度分桶记账；默认 -1 = 不记录。
+        """
         if h in self._slot:
             self.touch(h)
             return True
@@ -153,6 +205,9 @@ class _DeferPendingPool:
         self._lru[h] = None
         self.inflight.add(h)
         self.admits += 1
+        if self.possel:
+            self._pos_of[h] = int(pos)
+            self._admits_by_b[self._pb(pos)] += 1
         self.peak = max(self.peak, len(self._slot))
         return True
 
@@ -170,8 +225,17 @@ class _DeferPendingPool:
             return None
         self.pinned[h] = self.pinned.get(h, 0) + 1
         self.hits += 1
+        self._reads[h] = self._reads.get(h, 0) + 1  # A 批：命中计数
+        if self.possel:
+            _p = self._pos_of.get(h)
+            if _p is not None:
+                self._hits_by_b[self._pb(_p)] += 1
         self.touch(h)
         return self._slot[h]
+
+    def redeemable(self, h: bytes) -> bool:
+        """A 批：是否已达落盘门槛（θ 或 LRU-K 的 K）；min_reads=1 时恒真。"""
+        return self._reads.get(h, 0) >= self.min_reads
 
     def pin_protect(self, h: bytes) -> None:
         """落盘期间的槽位保护（非命中计数）：pwritev 未完成前 LRU 不可逐出。"""
@@ -206,6 +270,13 @@ class _DeferPendingPool:
             "dropped_set": len(self.dropped),
             "dropped_then_requested": self.dropped_then_requested,
             "pending_peak": self.peak,
+            "min_reads": self.min_reads,
+            "evict_flushed": self.evict_flushed,
+            "possel": self.possel,
+            "admits_by_b": list(self._admits_by_b),
+            "hits_by_b": list(self._hits_by_b),
+            "drops_by_b": list(self._drops_by_b),
+            "possel_evictions": self.possel_evictions,
         }
 
 
@@ -847,6 +918,10 @@ class SimpleCPUOffloadScheduler:
         trt_keep_head_blocks: int = 0,
         defer_pending_bytes: int = 0,
         evict_writeback: bool = False,
+        defer_min_reads: int = 1,
+        kvadmit_lru_k: int = 0,
+        possel: int = 0,
+        wrc_rho: float = 0.0,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -916,6 +991,17 @@ class SimpleCPUOffloadScheduler:
         # 激活后 eager 扫描的块全部改道 pending 池，逐块 gate 被旁路，
         # 落盘只经首读兑现（INV1）。与 v3/v4/v5 信号正交、与 lag 互斥。
         self._v6_pool: _DeferPendingPool | None = None
+        # R 批（§18）写/算联合准入控制器状态（默认关：wrc_rho <= 0）
+        self._wrc_rho = float(wrc_rho)
+        self._wrc_theta_max = 16
+        self._wrc_dwell = 512
+        self._wrc_ticks = 0
+        self._wrc_adjusts = 0
+        self._wrc_last_dec = 0
+        self._wrc_trace: list[dict] = []
+        # D 批（§19）辨识仪器字段（零机制改动）
+        self._diag_ticks = 0
+        self._diag_cpu_min: int | None = None
         self._v6_store_events: dict[int, tuple[list[int], list[bytes]]] = {}
         self._v6_flush_events: dict[int, list[tuple[bytes, int]]] = {}
         self._v6_hit_pins: dict[str, tuple[list[bytes], list[int]]] = {}
@@ -953,6 +1039,10 @@ class SimpleCPUOffloadScheduler:
                     if profiler.PROFILE else None,
                     on_evict_wb=(self._v6_evict_writeback
                                  if evict_writeback else None),
+                    min_reads=(kvadmit_lru_k if kvadmit_lru_k > 0
+                               else defer_min_reads),
+                    reads_survive_drop=(kvadmit_lru_k > 0),
+                    possel=possel,
                 )
                 logger.info(
                     "SimpleCPUOffloadScheduler: WriteGate v6 defer 池 %d 槽"
@@ -960,6 +1050,12 @@ class SimpleCPUOffloadScheduler:
                     "落盘仅经首读兑现（INV1）",
                     slots, defer_pending_bytes / (1024**3), block_bytes,
                     "WB" if evict_writeback else "drop")
+                if self._wrc_rho > 0:
+                    logger.info(
+                        "SimpleCPUOffloadScheduler: R 批 wrc 控制器启用 "
+                        "ρ*=%.4f（θ0=%d ≤%d，dwell=%d 决策）",
+                        self._wrc_rho, self._v6_pool.min_reads,
+                        self._wrc_theta_max, self._wrc_dwell)
         elif evict_writeback:
             logger.warning(
                 "WriteGate v6 evict_writeback 需要 defer 池"
@@ -1467,6 +1563,8 @@ class SimpleCPUOffloadScheduler:
             load_pairs.append((pslot, gpu_id))
             if h in pool.flushed:
                 continue
+            if not pool.redeemable(h):
+                continue  # A 批：未达落盘门槛（θ / LRU-K），本次不落盘
             cpu_blk = None
             if seg_alloc is not None:
                 aff_key = f"g{gpu_id // 32}"
@@ -1532,10 +1630,82 @@ class SimpleCPUOffloadScheduler:
             profiler.note_store_decision(1, 0, [h])
         return True
 
+    def diag_tick(self) -> None:
+        """D 批（§19 M1-lite）辨识仪器：每步采样 CPU offload cache 的空闲块数。
+
+        H1（容量）的决定性计数器：若 `cpu_min_free` 从未为 0，则缓存从未被打空
+        ⇒ 落盘占用不可能挤走活前缀 ⇒ 容量假设被证伪。**只读、零机制改动。**
+        """
+        n_free = self.cpu_block_pool.get_num_free_blocks()
+        self._diag_ticks += 1
+        if self._diag_cpu_min is None or n_free < self._diag_cpu_min:
+            self._diag_cpu_min = n_free
+        state = {
+            "num_cpu_blocks": self.num_cpu_blocks,
+            "cpu_min_free": self._diag_cpu_min,
+            "cpu_free_last": n_free,
+            "ticks": self._diag_ticks,
+        }
+        if self._v6_pool is not None:
+            state["pool_drops"] = self._v6_pool.drops
+            state["pool_flushes"] = self._v6_pool.flushes
+            state["pool_evict_flushed"] = self._v6_pool.evict_flushed
+            state["pool_pending_peak"] = self._v6_pool.peak
+        profiler.note_diag_state(state)
+
+    def wrc_tick(self) -> None:
+        """R 批（§18）：写/算联合准入控制器（仅 wrc 臂；默认关）。
+
+        预登记预算 ρ*：``recomputed_tokens / prompt_tokens <= ρ*``。
+        每步读仪器侧累计 (R, P) 与池决策数，按 AIMD 在线调 ``pool.min_reads``
+        （θ）：θ↑ = 落盘更严 = 写更少 = 重算更多。方向：
+          - R/P > ρ*（超预算，重算过多）=> θ-1（多写，逼近预算）；
+          - R/P < ρ*/2（预算充裕）      => θ+1（少写，省体积）；
+          - 迟滞带 [ρ*/2, ρ*] 内不动。
+        带冷却（每 ``_wrc_dwell`` 次池决策至多调一次），避免池风暴期抖动。
+        """
+        pool = self._v6_pool
+        if pool is None or self._wrc_rho <= 0.0:
+            return
+        self._wrc_ticks += 1
+        decisions = pool.admits + pool.drops + pool.flushes
+        if decisions - self._wrc_last_dec < self._wrc_dwell:
+            return
+        self._wrc_last_dec = decisions
+        _totals = getattr(profiler, "recompute_totals", None)
+        if _totals is None:
+            return  # 仪器补丁未打（应由 runner preflight 拦住）
+        rc = _totals()
+        n_prompt = float(rc.get("prompt_tokens", 0) or 0)
+        if n_prompt <= 0.0:
+            return
+        ratio = float(rc.get("recomputed_tokens", 0) or 0) / n_prompt
+        theta = pool.min_reads
+        if ratio > self._wrc_rho:
+            new_theta = max(1, theta - 1)
+        elif ratio < 0.5 * self._wrc_rho:
+            new_theta = min(self._wrc_theta_max, theta + 1)
+        else:
+            new_theta = theta
+        if new_theta != theta:
+            pool.min_reads = new_theta
+            self._wrc_adjusts += 1
+        self._wrc_trace.append(
+            {
+                "decisions": decisions,
+                "theta": pool.min_reads,
+                "ratio": round(ratio, 5),
+            }
+        )
+        if len(self._wrc_trace) > 256:
+            del self._wrc_trace[:-256]
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
     ) -> SimpleCPUOffloadMetadata:
+        self.wrc_tick()  # R 批：写/算联合准入控制器（默认关，开销 ~0）
+        self.diag_tick()  # D 批：辨识计数器（只读采样，零机制改动）
         # --- Stores ---
         store_event = -1
         store_gpu, store_cpu, store_req_ids = self.prepare_store_specs(scheduler_output)
@@ -1944,7 +2114,7 @@ class SimpleCPUOffloadScheduler:
                             _pool.touch(bhash_with_group)
                             advanced_per_group[g] += 1
                             continue
-                        if _pool.admit(bhash_with_group):
+                        if _pool.admit(bhash_with_group, pos):
                             self._v6_store_outbox.append(
                                 (gpu_block_id, _pool.slot_of(bhash_with_group)))
                             self._v6_store_event_rec[0].append(gpu_block_id)
@@ -2043,6 +2213,14 @@ class SimpleCPUOffloadScheduler:
             )
             if self._v6_pool is not None:
                 profiler.note_v6_state(self._v6_pool.snapshot())
+            if self._wrc_rho > 0 and self._v6_pool is not None:
+                profiler.note_wrc_state({
+                    "rho": self._wrc_rho,
+                    "theta": self._v6_pool.min_reads,
+                    "ticks": self._wrc_ticks,
+                    "adjusts": self._wrc_adjusts,
+                    "trace": self._wrc_trace[-64:],
+                })
             if self._gate_ctrl is not None:
                 # 闭环反馈回路：把本步写盘块推入存活窗，成熟后回算在线死写率，
                 # 由死写率驱动准入档位；档位快照随 profiler 分片落盘。
